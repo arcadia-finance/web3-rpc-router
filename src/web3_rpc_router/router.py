@@ -79,8 +79,19 @@ class RPCRouter:
         if not providers:
             raise ValueError(f"No providers configured for chain {chain_id}")
 
+        max_block = max(p.last_block for p in providers)
+
         for p in providers:
             if p.healthy:
+                behind = max_block - p.last_block
+                logger.info(
+                    "Chain %d → selected provider: %s (priority %d, block %d, %d behind head)",
+                    chain_id,
+                    p.config.name,
+                    p.config.priority,
+                    p.last_block,
+                    behind,
+                )
                 return p
 
         logger.warning(
@@ -123,3 +134,37 @@ class RPCRouter:
             }
             for p in self._providers.get(chain_id, [])
         ]
+
+    def status(self) -> Dict[int, List[dict]]:
+        """Return a summary of all providers across all chains.
+
+        Returns a dict keyed by chain_id, each containing a list of provider
+        status dicts with a ``behind`` field showing blocks behind the chain head.
+        """
+        result: Dict[int, List[dict]] = {}
+        for chain_id, providers in self._providers.items():
+            max_block = max((p.last_block for p in providers), default=0)
+            result[chain_id] = [
+                {
+                    "name": p.config.name,
+                    "priority": p.config.priority,
+                    "healthy": p.healthy,
+                    "last_block": p.last_block,
+                    "behind": max_block - p.last_block,
+                    "last_check": p.last_check,
+                }
+                for p in providers
+            ]
+        return result
+
+    def log_status(self) -> None:
+        """Log a human-readable summary of all providers."""
+        for chain_id, providers in self.status().items():
+            lines = []
+            for p in providers:
+                health = "OK" if p["healthy"] else "DOWN"
+                lines.append(
+                    f"  {p['name']} (pri={p['priority']}): {health}, "
+                    f"block={p['last_block']}, behind={p['behind']}"
+                )
+            logger.info("Chain %d providers:\n%s", chain_id, "\n".join(lines))
