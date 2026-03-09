@@ -84,7 +84,7 @@ class RPCRouter:
         for p in providers:
             if p.healthy:
                 behind = max_block - p.last_block
-                logger.info(
+                logger.debug(
                     "Chain %d → selected provider: %s (priority %d, block %d, %d behind head)",
                     chain_id,
                     p.config.name,
