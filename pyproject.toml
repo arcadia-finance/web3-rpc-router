@@ -1,0 +1,18 @@
+[tool.poetry]
+name = "web3-rpc-router"
+version = "0.1.0"
+description = "Multi-provider RPC routing for web3.py with health checking"
+authors = []
+packages = [{include = "web3_rpc_router", from = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.10"
+web3 = "^6.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7"
+pytest-asyncio = ">=0.21"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
