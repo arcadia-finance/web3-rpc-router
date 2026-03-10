@@ -19,9 +19,11 @@ class HealthChecker:
         interval: float,
         max_block_lag: int,
         timeout: float,
+        retry_interval: float = 30.0,
     ) -> None:
         self._providers = providers
         self._interval = interval
+        self._retry_interval = retry_interval
         self._max_block_lag = max_block_lag
         self._timeout = timeout
         self._task: Optional[asyncio.Task] = None
@@ -36,9 +38,18 @@ class HealthChecker:
             self._task.cancel()
             self._task = None
 
+    def _has_unhealthy(self) -> bool:
+        """Return True if any provider across all chains is unhealthy."""
+        return any(
+            not p.healthy
+            for providers in self._providers.values()
+            for p in providers
+        )
+
     async def _loop(self) -> None:
         while True:
-            await asyncio.sleep(self._interval)
+            sleep = self._retry_interval if self._has_unhealthy() else self._interval
+            await asyncio.sleep(sleep)
             try:
                 await self.check_all()
             except Exception:
