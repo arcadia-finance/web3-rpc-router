@@ -142,6 +142,73 @@ class TestCheckAll:
         assert p1.last_check > 0
 
 
+class TestRetryInterval:
+    @pytest.mark.asyncio
+    async def test_has_unhealthy_when_provider_down(self):
+        p1 = _make_provider("a", block_number=100)
+        p2 = _make_provider("b", block_number=100)
+        _fail_provider(p2)
+        providers = {1: [p1, p2]}
+
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+        await checker.check_all()
+
+        assert checker._has_unhealthy() is True
+
+    @pytest.mark.asyncio
+    async def test_has_unhealthy_false_when_all_healthy(self):
+        p1 = _make_provider("a", block_number=100)
+        p2 = _make_provider("b", block_number=100)
+        providers = {1: [p1, p2]}
+
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+        await checker.check_all()
+
+        assert checker._has_unhealthy() is False
+
+    @pytest.mark.asyncio
+    async def test_loop_uses_retry_interval_when_unhealthy(self):
+        """When a provider is unhealthy, the loop should sleep retry_interval, not interval."""
+        p1 = _make_provider("a", block_number=100)
+        p2 = _make_provider("b", block_number=100)
+        _fail_provider(p2)
+        providers = {1: [p1, p2]}
+
+        checker = HealthChecker(
+            providers, interval=600, max_block_lag=1, timeout=5, retry_interval=0.05,
+        )
+        await checker.check_all()
+        assert p2.healthy is False
+
+        # Fix p2 and start the loop — it should re-check within retry_interval
+        _set_block(p2, 100)
+        checker.start()
+        await asyncio.sleep(0.15)  # 3x retry_interval to be safe
+        checker.stop()
+
+        assert p2.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_loop_uses_full_interval_when_all_healthy(self):
+        """When all providers are healthy, the loop should sleep the full interval."""
+        p1 = _make_provider("a", block_number=100)
+        providers = {1: [p1]}
+
+        checker = HealthChecker(
+            providers, interval=600, max_block_lag=1, timeout=5, retry_interval=0.05,
+        )
+        await checker.check_all()
+        first_check = p1.last_check
+
+        # Start the loop — it should NOT re-check within retry_interval
+        checker.start()
+        await asyncio.sleep(0.15)
+        checker.stop()
+
+        # last_check should be unchanged since interval=600 hasn't elapsed
+        assert p1.last_check == first_check
+
+
 class TestStartStop:
     @pytest.mark.asyncio
     async def test_start_creates_task(self):

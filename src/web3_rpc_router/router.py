@@ -32,10 +32,12 @@ class RPCRouter:
         check_interval: float = 900.0,
         max_block_lag: int = 1,
         health_check_timeout: float = 5.0,
+        retry_interval: float = 30.0,
     ) -> None:
         self._check_interval = check_interval
         self._max_block_lag = max_block_lag
         self._health_check_timeout = health_check_timeout
+        self._retry_interval = retry_interval
         self._providers: Dict[int, List[ProviderState]] = {}
         self._health_checker: Optional[HealthChecker] = None
         self._started = False
@@ -57,6 +59,7 @@ class RPCRouter:
             interval=self._check_interval,
             max_block_lag=self._max_block_lag,
             timeout=self._health_check_timeout,
+            retry_interval=self._retry_interval,
         )
         await self._health_checker.check_all()
         self._health_checker.start()
