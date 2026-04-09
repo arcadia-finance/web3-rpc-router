@@ -79,7 +79,7 @@ class HealthChecker:
             for p, result in provider_results:
                 if isinstance(result, Exception):
                     logger.warning(
-                        "Health check failed for %s (chain %d): %s",
+                        "Health check failed for %s (chain %d): %r",
                         p.config.name, chain_id, result,
                     )
                     p._consecutive_failures = getattr(p, "_consecutive_failures", 0) + 1
