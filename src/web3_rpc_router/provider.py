@@ -41,8 +41,6 @@ class ProviderState:
                 request_kwargs={"timeout": timeout},
             )
         )
-        # Dedicated instance for health checks so they don't compete
-        # with app traffic on the same connection pool
         self.health_w3 = AsyncWeb3(
             AsyncWeb3.AsyncHTTPProvider(
                 self.config.url,
