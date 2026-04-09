@@ -56,44 +56,48 @@ class HealthChecker:
                 logger.exception("Health check cycle failed")
 
     async def check_all(self) -> None:
-        """Check all providers across all chains."""
-        for chain_id, providers in self._providers.items():
-            results = await asyncio.gather(
-                *(self._check_one(p) for p in providers),
-                return_exceptions=True,
-            )
+        """Check all providers across all chains in parallel."""
+        # Check all providers across all chains concurrently
+        all_providers = [
+            (chain_id, p)
+            for chain_id, providers in self._providers.items()
+            for p in providers
+        ]
+        results = await asyncio.gather(
+            *(self._check_one(p) for _, p in all_providers),
+            return_exceptions=True,
+        )
 
-            # Find highest block number (keep previous block on failure)
+        # Group results back by chain
+        chain_results: Dict[int, List[tuple]] = {}
+        for (chain_id, p), result in zip(all_providers, results):
+            chain_results.setdefault(chain_id, []).append((p, result))
+
+        # Process results per chain
+        for chain_id, provider_results in chain_results.items():
             max_block = 0
-            for p, result in zip(providers, results):
+            for p, result in provider_results:
                 if isinstance(result, Exception):
                     logger.debug(
                         "Health check failed for %s (chain %d): %s",
                         p.config.name, chain_id, result,
                     )
-                    # Don't reset last_block — keep the previous value so
-                    # a single timeout doesn't erase known-good state.
-                    # Mark unhealthy via consecutive failure tracking below.
                     p._consecutive_failures = getattr(p, "_consecutive_failures", 0) + 1
                 else:
                     p.last_block = result
                     p._consecutive_failures = 0
                     max_block = max(max_block, result)
 
-            # If no provider returned a block, use the best previous block
             if max_block == 0:
-                max_block = max((p.last_block for p in providers), default=0)
+                max_block = max((p.last_block for p, _ in provider_results), default=0)
 
-            # Update health status
             now = time.time()
-            for p in providers:
+            for p, _ in provider_results:
                 was_healthy = p.healthy
                 failures = getattr(p, "_consecutive_failures", 0)
                 if failures >= 3:
-                    # Only mark unhealthy after 3 consecutive failures
                     p.healthy = False
                 elif p.last_block == 0:
-                    # Never got a block — still initializing or truly down
                     p.healthy = False
                 else:
                     p.healthy = (max_block - p.last_block) <= self._max_block_lag
