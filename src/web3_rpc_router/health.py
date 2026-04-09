@@ -120,8 +120,8 @@ class HealthChecker:
                     )
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number using async web3."""
+        """Query a single provider's block number using a dedicated health check web3 instance."""
         return await asyncio.wait_for(
-            p.async_w3.eth.get_block_number(),
+            p.health_w3.eth.get_block_number(),
             timeout=self._timeout,
         )
