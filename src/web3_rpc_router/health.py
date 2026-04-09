@@ -78,7 +78,7 @@ class HealthChecker:
             max_block = 0
             for p, result in provider_results:
                 if isinstance(result, Exception):
-                    logger.debug(
+                    logger.warning(
                         "Health check failed for %s (chain %d): %s",
                         p.config.name, chain_id, result,
                     )
@@ -120,8 +120,9 @@ class HealthChecker:
                     )
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number using async web3."""
+        """Query a single provider's block number using a dedicated instance
+        with its own connection pool, so health checks aren't blocked by app traffic."""
         return await asyncio.wait_for(
-            p.async_w3.eth.get_block_number(),
+            p.health_w3.eth.get_block_number(),
             timeout=self._timeout,
         )
