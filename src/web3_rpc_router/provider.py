@@ -22,7 +22,7 @@ class ProviderState:
     config: ProviderConfig
     w3: Web3 = field(init=False, repr=False)
     async_w3: AsyncWeb3 = field(init=False, repr=False)
-    health_w3: AsyncWeb3 = field(init=False, repr=False)
+    health_w3: Web3 = field(init=False, repr=False)
     healthy: bool = True
     last_block: int = 0
     last_check: float = 0.0
@@ -41,8 +41,8 @@ class ProviderState:
                 request_kwargs={"timeout": timeout},
             )
         )
-        self.health_w3 = AsyncWeb3(
-            AsyncWeb3.AsyncHTTPProvider(
+        self.health_w3 = Web3(
+            Web3.HTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": 5},
             )
