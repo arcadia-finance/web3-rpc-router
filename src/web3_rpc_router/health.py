@@ -120,9 +120,6 @@ class HealthChecker:
                     )
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number using a sync Web3 instance
-        in a thread, avoiding aiohttp session issues."""
-        return await asyncio.wait_for(
-            asyncio.to_thread(lambda: p.health_w3.eth.block_number),
-            timeout=self._timeout,
-        )
+        """Query a single provider's block number using sync Web3 in a thread.
+        The HTTPProvider's own timeout (from ProviderConfig.request_timeout) handles slow RPCs."""
+        return await asyncio.to_thread(lambda: p.w3.eth.block_number)
