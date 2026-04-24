@@ -25,6 +25,10 @@ class ProviderState:
     healthy: bool = True
     last_block: int = 0
     last_check: float = 0.0
+    # Epoch seconds until which this provider is demoted due to a real-request
+    # failure reported via RPCRouter.report_failure(). Cleared by a successful
+    # background health check.
+    cooldown_until: float = 0.0
 
     def __post_init__(self) -> None:
         timeout = self.config.request_timeout

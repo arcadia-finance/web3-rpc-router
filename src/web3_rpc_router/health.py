@@ -86,6 +86,9 @@ class HealthChecker:
                 else:
                     p.last_block = result
                     p._consecutive_failures = 0
+                    # Clear any request-level cooldown: if the provider is
+                    # answering again, let the router consider it fresh.
+                    p.cooldown_until = 0.0
                     max_block = max(max_block, result)
 
             if max_block == 0:

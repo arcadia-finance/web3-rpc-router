@@ -1,4 +1,5 @@
 import asyncio
+import time
 from unittest.mock import AsyncMock
 
 import pytest
@@ -207,6 +208,53 @@ class TestRetryInterval:
 
         # last_check should be unchanged since interval=600 hasn't elapsed
         assert p1.last_check == first_check
+
+
+class TestCooldownReset:
+    """A successful health check should clear the request-level cooldown so the
+    provider becomes eligible for selection again without waiting for the
+    cooldown timer to expire naturally.
+    """
+
+    @pytest.mark.asyncio
+    async def test_successful_check_clears_cooldown(self, monkeypatch):
+        p1 = ProviderState(
+            config=ProviderConfig(name="a", url="http://fake", priority=1)
+        )
+        p1.cooldown_until = time.time() + 120  # demoted
+        providers = {1: [p1]}
+
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+        # Bypass the broken thread-based block_number probe by stubbing
+        # _check_one directly — we only care about the post-success bookkeeping.
+        async def ok(_p):
+            return 100
+        monkeypatch.setattr(checker, "_check_one", ok)
+
+        await checker.check_all()
+
+        assert p1.cooldown_until == 0.0
+        assert p1.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_failed_check_preserves_cooldown(self, monkeypatch):
+        p1 = ProviderState(
+            config=ProviderConfig(name="a", url="http://fake", priority=1)
+        )
+        target = time.time() + 120
+        p1.cooldown_until = target
+        providers = {1: [p1]}
+
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+        async def boom(_p):
+            raise ConnectionError("down")
+        monkeypatch.setattr(checker, "_check_one", boom)
+
+        await checker.check_all()
+
+        # Health check failed, so cooldown must NOT be reset — the provider
+        # should still be treated as demoted by the router.
+        assert p1.cooldown_until == target
 
 
 class TestStartStop:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from typing import Dict, List, Optional
 
 from web3 import AsyncWeb3, Web3
@@ -77,15 +78,22 @@ class RPCRouter:
         return list(self._providers.keys())
 
     def _select_provider(self, chain_id: int) -> ProviderState:
-        """Select the best healthy provider for the given chain."""
+        """Select the best provider for the given chain.
+
+        Preference order:
+          1. Healthy and not in request-level cooldown.
+          2. Healthy but in cooldown (all fresh providers unavailable).
+          3. First provider in priority order (degraded mode).
+        """
         providers = self._providers.get(chain_id)
         if not providers:
             raise ValueError(f"No providers configured for chain {chain_id}")
 
         max_block = max(p.last_block for p in providers)
+        now = time.time()
 
         for p in providers:
-            if p.healthy:
+            if p.healthy and p.cooldown_until <= now:
                 behind = max_block - p.last_block
                 logger.debug(
                     "Chain %d → selected provider: %s (priority %d, block %d, %d behind head)",
@@ -97,12 +105,52 @@ class RPCRouter:
                 )
                 return p
 
+        for p in providers:
+            if p.healthy:
+                logger.warning(
+                    "Chain %d → all fresh providers cooling down, falling back to %s "
+                    "(cooldown expires in %.1fs)",
+                    chain_id,
+                    p.config.name,
+                    max(0.0, p.cooldown_until - now),
+                )
+                return p
+
         logger.warning(
             "All providers unhealthy for chain %d, using %s in degraded mode",
             chain_id,
             providers[0].config.name,
         )
         return providers[0]
+
+    def report_failure(self, chain_id: int, cooldown: float = 60.0) -> None:
+        """Demote the currently-selected provider for ``chain_id``.
+
+        Called by consumers when a real request (not the background health
+        check) fails on whichever provider was handed out most recently —
+        timeouts, connection errors, etc. The provider is skipped by
+        ``_select_provider`` for ``cooldown`` seconds, giving the retry loop a
+        chance to rotate to the next-priority provider. The cooldown is cleared
+        automatically by the next successful background health check.
+
+        Safe to call when no providers are configured for the chain (no-op).
+        The selection used to identify "currently-selected" is the same logic
+        ``get_web3`` / ``get_async_web3`` use, so the demoted provider is the
+        one most likely responsible for the failure.
+        """
+        if not self._providers.get(chain_id):
+            return
+        try:
+            state = self._select_provider(chain_id)
+        except ValueError:
+            return
+        state.cooldown_until = time.time() + cooldown
+        logger.warning(
+            "Provider %s (chain %d) demoted for %.0fs after request-level failure",
+            state.config.name,
+            chain_id,
+            cooldown,
+        )
 
     def get_web3(self, chain_id: int) -> Web3:
         """Return the best sync Web3 instance for the given chain.
@@ -145,6 +193,7 @@ class RPCRouter:
         status dicts with a ``behind`` field showing blocks behind the chain head.
         """
         result: Dict[int, List[dict]] = {}
+        now = time.time()
         for chain_id, providers in self._providers.items():
             max_block = max((p.last_block for p in providers), default=0)
             result[chain_id] = [
@@ -155,6 +204,7 @@ class RPCRouter:
                     "last_block": p.last_block,
                     "behind": max_block - p.last_block,
                     "last_check": p.last_check,
+                    "cooldown_remaining": max(0.0, p.cooldown_until - now),
                 }
                 for p in providers
             ]
@@ -166,8 +216,13 @@ class RPCRouter:
             lines = []
             for p in providers:
                 health = "OK" if p["healthy"] else "DOWN"
+                cooldown = (
+                    f", cooldown={p['cooldown_remaining']:.0f}s"
+                    if p["cooldown_remaining"] > 0
+                    else ""
+                )
                 lines.append(
                     f"  {p['name']} (pri={p['priority']}): {health}, "
-                    f"block={p['last_block']}, behind={p['behind']}"
+                    f"block={p['last_block']}, behind={p['behind']}{cooldown}"
                 )
             logger.info("Chain %d providers:\n%s", chain_id, "\n".join(lines))

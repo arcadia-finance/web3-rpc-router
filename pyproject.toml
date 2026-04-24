@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "web3-rpc-router"
-version = "0.1.1"
+version = "0.2.0"
 description = "Multi-provider RPC routing for web3.py with health checking"
 authors = []
 packages = [{include = "web3_rpc_router", from = "src"}]
