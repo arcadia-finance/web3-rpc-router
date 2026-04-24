@@ -41,9 +41,7 @@ class HealthChecker:
     def _has_unhealthy(self) -> bool:
         """Return True if any provider across all chains is unhealthy."""
         return any(
-            not p.healthy
-            for providers in self._providers.values()
-            for p in providers
+            not p.healthy for providers in self._providers.values() for p in providers
         )
 
     async def _loop(self) -> None:
@@ -80,7 +78,9 @@ class HealthChecker:
                 if isinstance(result, Exception):
                     logger.warning(
                         "Health check failed for %s (chain %d): %r",
-                        p.config.name, chain_id, result,
+                        p.config.name,
+                        chain_id,
+                        result,
                     )
                     p._consecutive_failures = getattr(p, "_consecutive_failures", 0) + 1
                 else:
@@ -124,5 +124,15 @@ class HealthChecker:
 
     async def _check_one(self, p: ProviderState) -> int:
         """Query a single provider's block number using sync Web3 in a thread.
-        The HTTPProvider's own timeout (from ProviderConfig.request_timeout) handles slow RPCs."""
-        return await asyncio.to_thread(lambda: p.w3.eth.block_number)
+
+        The outer ``asyncio.wait_for`` enforces ``self._timeout`` at the
+        asyncio layer — the underlying HTTPProvider has its own longer timeout
+        (``ProviderConfig.request_timeout``, default 15s), so without this
+        wrapper a flaky provider answering in e.g. 12s would still be counted
+        as "healthy". The stray thread is allowed to finish on its own; only
+        the health-check outcome is timed.
+        """
+        return await asyncio.wait_for(
+            asyncio.to_thread(lambda: p.w3.eth.block_number),
+            timeout=self._timeout,
+        )

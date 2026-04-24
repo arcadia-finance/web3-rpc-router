@@ -176,7 +176,11 @@ class TestRetryInterval:
         providers = {1: [p1, p2]}
 
         checker = HealthChecker(
-            providers, interval=600, max_block_lag=1, timeout=5, retry_interval=0.05,
+            providers,
+            interval=600,
+            max_block_lag=1,
+            timeout=5,
+            retry_interval=0.05,
         )
         await checker.check_all()
         assert p2.healthy is False
@@ -196,7 +200,11 @@ class TestRetryInterval:
         providers = {1: [p1]}
 
         checker = HealthChecker(
-            providers, interval=600, max_block_lag=1, timeout=5, retry_interval=0.05,
+            providers,
+            interval=600,
+            max_block_lag=1,
+            timeout=5,
+            retry_interval=0.05,
         )
         await checker.check_all()
         first_check = p1.last_check
@@ -225,10 +233,12 @@ class TestCooldownReset:
         providers = {1: [p1]}
 
         checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
         # Bypass the broken thread-based block_number probe by stubbing
         # _check_one directly — we only care about the post-success bookkeeping.
         async def ok(_p):
             return 100
+
         monkeypatch.setattr(checker, "_check_one", ok)
 
         await checker.check_all()
@@ -246,8 +256,10 @@ class TestCooldownReset:
         providers = {1: [p1]}
 
         checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
         async def boom(_p):
             raise ConnectionError("down")
+
         monkeypatch.setattr(checker, "_check_one", boom)
 
         await checker.check_all()
