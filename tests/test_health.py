@@ -1,6 +1,5 @@
 import asyncio
 import time
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -8,26 +7,46 @@ from web3_rpc_router.provider import ProviderConfig, ProviderState
 from web3_rpc_router.health import HealthChecker
 
 
+class _FakeEth:
+    """Stand-in for `w3.eth` whose `block_number` property returns a value or raises.
+
+    `HealthChecker._check_one` reads the SYNC `p.w3.eth.block_number` (via
+    `asyncio.to_thread`), so the health probe is stubbed there, not on the async client.
+    """
+
+    def __init__(self, block_number=None, error=None):
+        self._block_number = block_number
+        self._error = error
+
+    @property
+    def block_number(self):
+        if self._error is not None:
+            raise self._error
+        return self._block_number
+
+
+class _FakeW3:
+    def __init__(self, eth):
+        self.eth = eth
+
+
 def _make_provider(name, priority=1, block_number=100):
-    """Create a ProviderState with a mocked async_w3.eth.get_block_number."""
+    """Create a ProviderState whose sync w3.eth.block_number returns `block_number`."""
     state = ProviderState(
         config=ProviderConfig(name=name, url="http://fake", priority=priority)
     )
-    # Mock the async web3 used by the health checker
-    state.async_w3.eth.get_block_number = AsyncMock(return_value=block_number)
+    state.w3 = _FakeW3(_FakeEth(block_number=block_number))
     return state
 
 
 def _fail_provider(state, error=None):
     """Make a provider's health check fail."""
-    state.async_w3.eth.get_block_number = AsyncMock(
-        side_effect=error or ConnectionError("down")
-    )
+    state.w3 = _FakeW3(_FakeEth(error=error or ConnectionError("down")))
 
 
 def _set_block(state, block_number):
     """Update a provider's mock block number."""
-    state.async_w3.eth.get_block_number = AsyncMock(return_value=block_number)
+    state.w3 = _FakeW3(_FakeEth(block_number=block_number))
 
 
 class TestCheckAll:
