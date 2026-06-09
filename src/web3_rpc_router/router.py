@@ -8,7 +8,7 @@ import aiohttp
 from web3 import AsyncWeb3, Web3
 
 from web3_rpc_router.health import HealthChecker
-from web3_rpc_router.provider import ProviderConfig, ProviderState
+from web3_rpc_router.provider import ProviderConfig, ProviderState, RoutingProvider
 
 logger = logging.getLogger("web3_rpc_router")
 
@@ -197,6 +197,16 @@ class RPCRouter:
             ValueError: If no providers are configured for the chain.
         """
         return self._select_provider(chain_id).w3
+
+    def web3(self, chain_id: int) -> Web3:
+        """Return a Web3 backed by a RoutingProvider for the chain.
+
+        Unlike get_web3 (which returns a fixed best-provider Web3 captured at call time), every
+        request on this Web3 re-selects the current-best provider and fails over on transport
+        errors. Use it as a drop-in `Web3` wherever the consumer reads/writes on-chain so the
+        call sites stay unchanged but follow the router.
+        """
+        return Web3(RoutingProvider(self, chain_id))
 
     def get_async_web3(self, chain_id: int) -> AsyncWeb3:
         """Return the best async AsyncWeb3 instance for the given chain.
