@@ -6,7 +6,7 @@ authors = []
 packages = [{include = "web3_rpc_router", from = "src"}]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = "^3.12"
 web3 = ">=6,<8"
 
 [tool.poetry.group.dev.dependencies]

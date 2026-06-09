@@ -1,8 +1,19 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
+import requests
 from web3 import AsyncWeb3, Web3
+from web3.providers.base import JSONBaseProvider
+from web3.types import RPCEndpoint, RPCResponse
+
+if TYPE_CHECKING:
+    from web3_rpc_router.router import RPCRouter
+
+# Transport-level failures that mean "this provider is bad, try the next one" (as opposed to an
+# RPC-level {"error": ...} response, which is deterministic and returned as-is).
+_FAILOVER_EXC = (OSError, TimeoutError, requests.exceptions.RequestException)
 
 
 @dataclass
@@ -44,3 +55,45 @@ class ProviderState:
                 request_kwargs={"timeout": timeout},
             )
         )
+
+
+class RoutingProvider(JSONBaseProvider):
+    """A sync web3 provider that sends each request to the RPCRouter's current-best provider for a
+    chain, failing over to the next provider on transport errors.
+
+    Lets a single `Web3` (built via `RPCRouter.web3(chain_id)`) transparently follow the router with
+    no consumer call-site changes: every `w3.eth.*` request re-selects the healthy provider. An
+    RPC-level ``{"error": ...}`` response is returned as-is (deterministic, not retried).
+    """
+
+    def __init__(self, router: "RPCRouter", chain_id: int) -> None:
+        super().__init__()
+        self._router = router
+        self._chain_id = chain_id
+
+    @property
+    def endpoint_uri(self) -> str:
+        return self._router._select_provider(self._chain_id).w3.provider.endpoint_uri
+
+    def is_connected(self, show_traceback: bool = False) -> bool:
+        try:
+            return self._router._select_provider(
+                self._chain_id
+            ).w3.provider.is_connected(show_traceback)
+        except Exception:
+            return False
+
+    def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
+        attempts = len(self._router._providers.get(self._chain_id, [])) or 1
+        last_exc: Exception | None = None
+        for _ in range(attempts):
+            state = self._router._select_provider(
+                self._chain_id
+            )  # raises ValueError if no providers
+            try:
+                return state.w3.provider.make_request(method, params)
+            except _FAILOVER_EXC as exc:
+                last_exc = exc
+                self._router.report_failure(self._chain_id)
+        assert last_exc is not None
+        raise last_exc
