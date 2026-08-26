@@ -50,9 +50,7 @@ def _make_provider(name, priority=1, block_number=100, delay=0.0):
 
 def _fail_provider(state, error=None):
     """Make a provider's health check fail."""
-    state.async_w3 = _FakeAsyncW3(
-        _FakeAsyncEth(error=error or ConnectionError("down"))
-    )
+    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(error=error or ConnectionError("down")))
 
 
 def _set_block(state, block_number):
