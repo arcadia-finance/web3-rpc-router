@@ -265,3 +265,26 @@ class TestResolverChoice:
         finally:
             for session in router._sessions:
                 await session.close()
+
+    @pytest.mark.asyncio
+    async def test_sessions_share_one_resolver_and_stop_closes_it(self):
+        """Passing a resolver makes the connector a borrower, so the router must close
+        it: aiohttp only closes a resolver it built itself.
+        """
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+        router.add_provider(1, ProviderConfig(name="b", url="http://b", priority=2))
+        await router._init_keepalive_sessions()
+
+        resolver = router._resolver
+        assert resolver is not None
+        assert len(router._sessions) == 2
+        # One resolver, borrowed by every connector.
+        for session in router._sessions:
+            assert session.connector._resolver is resolver
+            assert session.connector._resolver_owner is False
+
+        await router.stop()
+
+        assert router._resolver is None
+        assert all(s.closed for s in router._sessions) or router._sessions == []

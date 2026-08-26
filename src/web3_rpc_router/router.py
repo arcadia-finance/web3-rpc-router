@@ -68,6 +68,7 @@ class RPCRouter:
         self._connection_limit = connection_limit
         self._providers: Dict[int, List[ProviderState]] = {}
         self._sessions: List[aiohttp.ClientSession] = []
+        self._resolver: Optional["aiohttp.abc.AbstractResolver"] = None
         self._health_checker: Optional[HealthChecker] = None
         self._started = False
 
@@ -108,26 +109,35 @@ class RPCRouter:
         Pre-seeding the provider's session cache with a pooled connector restores
         connection reuse: measured ~30x faster at 50 concurrent calls.
         """
+        # One resolver shared by every session. Passing a resolver makes the connector a
+        # borrower rather than an owner (it only closes a resolver it built itself), so the
+        # router closes this one in stop(); a per-session resolver would leak a registration
+        # in aiohttp's shared DNS resolver manager on every start/stop cycle.
+        self._resolver = _build_resolver()
         for providers in self._providers.values():
             for p in providers:
                 session = aiohttp.ClientSession(
                     raise_for_status=True,
                     connector=aiohttp.TCPConnector(
                         limit=self._connection_limit,
-                        resolver=_build_resolver(),
+                        resolver=self._resolver,
                     ),
                 )
                 await p.async_w3.provider.cache_async_session(session)
                 self._sessions.append(session)
 
     async def stop(self) -> None:
-        """Stop the background health checker and close pooled sessions."""
+        """Stop the background health checker, then close the sessions and resolver."""
         if self._health_checker:
             self._health_checker.stop()
         for session in self._sessions:
             if not session.closed:
                 await session.close()
         self._sessions = []
+        # After the sessions, since they resolve through it.
+        if self._resolver is not None:
+            await self._resolver.close()
+            self._resolver = None
         self._started = False
 
     @property

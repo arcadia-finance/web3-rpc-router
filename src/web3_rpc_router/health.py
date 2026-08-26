@@ -67,14 +67,19 @@ class HealthChecker:
         and is skipped until it expires, so a permanently dead endpoint costs one
         probe per ``_BACKOFF_MAX`` instead of one per cycle. Its existing verdict
         stands while it is skipped, and one successful check clears the backoff.
+
+        Backoff is ignored on a chain with no healthy provider left. Such a chain is
+        being served in degraded mode, so noticing any provider come back outweighs
+        sparing a dead endpoint, and waiting out a capped window there would leave
+        selection stuck on ``providers[0]`` even once another provider recovered.
         """
         due = time.time()
-        all_providers = [
-            (chain_id, p)
-            for chain_id, providers in self._providers.items()
-            for p in providers
-            if p.next_check <= due
-        ]
+        all_providers = []
+        for chain_id, providers in self._providers.items():
+            chain_is_dark = not any(p.healthy for p in providers)
+            all_providers.extend(
+                (chain_id, p) for p in providers if chain_is_dark or p.next_check <= due
+            )
         if not all_providers:
             return
 

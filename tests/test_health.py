@@ -435,3 +435,48 @@ class TestProbeBackoff:
 
         assert p1.async_w3.eth.calls == 0
         assert p1.last_check == 0.0
+
+    @pytest.mark.asyncio
+    async def test_backoff_is_ignored_while_a_chain_has_no_healthy_provider(self):
+        """A dark chain is served in degraded mode, so noticing a recovery beats
+        sparing a dead endpoint: every provider is probed regardless of its window.
+        """
+        a = _make_provider("a")
+        b = _make_provider("b")
+        _fail_provider(a)
+        _fail_provider(b)
+        providers = {1: [a, b]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+
+        assert a.healthy is False and b.healthy is False
+        assert a.next_check > time.time()  # a backoff window is open...
+        probes = a.async_w3.eth.calls
+
+        await checker.check_all()  # ...but the chain has nothing healthy left
+
+        assert a.async_w3.eth.calls == probes + 1
+
+    @pytest.mark.asyncio
+    async def test_backoff_still_applies_while_the_chain_has_a_healthy_provider(self):
+        """The dark-chain exception must not defeat the backoff in the normal case."""
+        dead = _make_provider("dead")
+        _fail_provider(dead)
+        live = _make_provider("live", block_number=100)
+        providers = {1: [dead, live]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+        probes = dead.async_w3.eth.calls
+
+        await checker.check_all()
+
+        assert live.healthy is True
+        assert dead.async_w3.eth.calls == probes
