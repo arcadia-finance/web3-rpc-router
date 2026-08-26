@@ -362,3 +362,35 @@ class TestResolverChoice:
         assert len(router._sessions) == 1  # tracked, so stop() can close it
         await router.stop()
         assert router._resolver is None
+
+
+class TestDegradedModeUsesLastKnownGood:
+    def test_falls_back_to_the_provider_that_last_proved_it_works(self):
+        """The highest-priority provider is often the one whose failure got us here, so
+        priority order is the wrong fallback when nothing is healthy."""
+        router = RPCRouter()
+        router.add_provider(
+            1, ProviderConfig(name="primary", url="http://a", priority=1)
+        )
+        router.add_provider(
+            1, ProviderConfig(name="backup", url="http://b", priority=2)
+        )
+        primary, backup = router._providers[1]
+        primary.healthy = backup.healthy = False
+        primary.last_block = 100  # went dark a while ago
+        backup.last_block = 5_000  # answered much more recently
+
+        assert router._select_provider(1) is backup
+
+    def test_ties_and_cold_start_fall_back_to_priority(self):
+        router = RPCRouter()
+        router.add_provider(
+            1, ProviderConfig(name="primary", url="http://a", priority=1)
+        )
+        router.add_provider(
+            1, ProviderConfig(name="backup", url="http://b", priority=2)
+        )
+        for p in router._providers[1]:
+            p.healthy = False  # nothing has ever answered, last_block == 0
+
+        assert router._select_provider(1).config.name == "primary"

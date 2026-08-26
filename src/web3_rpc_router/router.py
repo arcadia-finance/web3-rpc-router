@@ -216,12 +216,20 @@ class RPCRouter:
                 )
                 return p
 
+        # Nothing is healthy. Fall back to whichever provider most recently proved it
+        # could answer, rather than to priority order: the highest-priority provider is
+        # often the one whose failure got us here, and last-known-good is the only
+        # evidence available. Ties, including a cold start where nothing has answered
+        # yet, fall back to priority.
+        best = max(providers, key=lambda p: (p.last_block, -p.config.priority))
         logger.warning(
-            "All providers unhealthy for chain %d, using %s in degraded mode",
+            "All providers unhealthy for chain %d, using last-known-good %s "
+            "(block %d) in degraded mode",
             chain_id,
-            providers[0].config.name,
+            best.config.name,
+            best.last_block,
         )
-        return providers[0]
+        return best
 
     def report_failure(self, chain_id: int, cooldown: float = 60.0) -> None:
         """Demote the currently-selected provider for ``chain_id``.
