@@ -1,5 +1,6 @@
 import time
 
+import aiohttp
 import pytest
 
 from web3_rpc_router import RPCRouter, ProviderConfig
@@ -240,3 +241,107 @@ class TestGetProviderStatus:
     def test_empty_for_unknown_chain(self):
         router = RPCRouter()
         assert router.get_provider_status(999) == []
+
+
+class TestResolverChoice:
+    """Sessions must get a resolver explicitly, and must still build without aiodns."""
+
+    @pytest.mark.asyncio
+    async def test_build_resolver_degrades_instead_of_raising(self):
+        from web3_rpc_router.router import _build_resolver
+
+        resolver = _build_resolver()
+        assert isinstance(resolver, (aiohttp.AsyncResolver, aiohttp.ThreadedResolver))
+
+    @pytest.mark.asyncio
+    async def test_keepalive_sessions_get_a_resolver(self):
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+        await router._init_keepalive_sessions()
+        try:
+            assert router._sessions
+            for session in router._sessions:
+                assert session.connector._resolver is not None
+        finally:
+            for session in router._sessions:
+                await session.close()
+
+    @pytest.mark.asyncio
+    async def test_sessions_share_one_resolver_and_stop_closes_it(self):
+        """Passing a resolver makes the connector a borrower, so the router must close
+        it: aiohttp only closes a resolver it built itself.
+        """
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+        router.add_provider(1, ProviderConfig(name="b", url="http://b", priority=2))
+        await router._init_keepalive_sessions()
+
+        resolver = router._resolver
+        assert resolver is not None
+        assert len(router._sessions) == 2
+        # One resolver, borrowed by every connector.
+        for session in router._sessions:
+            assert session.connector._resolver is resolver
+            assert session.connector._resolver_owner is False
+
+        sessions = list(router._sessions)  # stop() empties the list
+        await router.stop()
+
+        assert router._resolver is None
+        assert sessions and all(s.closed for s in sessions)
+
+    @pytest.mark.asyncio
+    async def test_probe_client_does_not_retry_but_real_traffic_does(self):
+        """One probe must be one request. web3 retries eth_blockNumber five times by
+        default, which would spend five requests on a refusing provider.
+        """
+        state = ProviderState(
+            config=ProviderConfig(name="a", url="http://a", priority=1)
+        )
+        assert state.probe_w3.provider.exception_retry_configuration is None
+        assert state.async_w3.provider.exception_retry_configuration is not None
+
+    @pytest.mark.asyncio
+    async def test_restart_keeps_the_routers_own_pooled_session(self):
+        """cache_async_session honours the session it is given only on a cache miss, so
+        a second start() would otherwise get a web3-built force_close session instead.
+        """
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+
+        await router._init_keepalive_sessions()
+        first = router._sessions[0]
+        provider = router._providers[1][0]
+        assert provider.async_w3.provider._request_session_manager.session_cache._data
+        await router.stop()
+
+        await router._init_keepalive_sessions()
+        try:
+            second = router._sessions[0]
+            assert second is not first
+            cached = list(
+                provider.async_w3.provider._request_session_manager.session_cache._data.values()
+            )
+            assert cached == [second]
+            assert second.connector._resolver is router._resolver
+            assert second.connector._force_close is False
+        finally:
+            await router.stop()
+
+    @pytest.mark.asyncio
+    async def test_a_session_is_tracked_before_it_is_handed_to_web3(self):
+        """A failure while handing the session over must not leak it."""
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+        provider = router._providers[1][0]
+
+        async def boom(_session):
+            raise RuntimeError("handover failed")
+
+        provider.async_w3.provider.cache_async_session = boom
+        with pytest.raises(RuntimeError):
+            await router._init_keepalive_sessions()
+
+        assert len(router._sessions) == 1  # tracked, so stop() can close it
+        await router.stop()
+        assert router._resolver is None

@@ -1,13 +1,16 @@
 [tool.poetry]
 name = "web3-rpc-router"
-version = "0.2.1"
+version = "0.3.0"
 description = "Multi-provider RPC routing for web3.py with health checking"
 authors = []
 packages = [{include = "web3_rpc_router", from = "src"}]
 
 [tool.poetry.dependencies]
 python = "^3.12"
-web3 = ">=6,<8"
+# web3 7 only: the health probe passes exception_retry_configuration to
+# AsyncHTTPProvider, which web3 6 does not accept, and _init_keepalive_sessions exists
+# to undo web3 7's force_close connector.
+web3 = ">=7,<8"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^7"
