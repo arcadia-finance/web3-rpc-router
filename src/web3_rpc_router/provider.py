@@ -33,6 +33,7 @@ class ProviderState:
     config: ProviderConfig
     w3: Web3 = field(init=False, repr=False)
     async_w3: AsyncWeb3 = field(init=False, repr=False)
+    probe_w3: AsyncWeb3 = field(init=False, repr=False)
     healthy: bool = True
     last_block: int = 0
     last_check: float = 0.0
@@ -59,6 +60,20 @@ class ProviderState:
             AsyncWeb3.AsyncHTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
+            )
+        )
+        # Health probes only, so they stay one request each. web3 retries
+        # eth_blockNumber up to five times with its own backoff, which against a
+        # refusing or rate-limited provider would spend five requests and most of the
+        # probe's timeout budget to reach a conclusion the first failure already gave.
+        # Real traffic keeps web3's retries: it goes through ``async_w3``.
+        # ``RPCRouter._init_keepalive_sessions`` points this at the same pooled session,
+        # so the extra provider costs no extra connections.
+        self.probe_w3 = AsyncWeb3(
+            AsyncWeb3.AsyncHTTPProvider(
+                self.config.url,
+                request_kwargs={"timeout": timeout},
+                exception_retry_configuration=None,
             )
         )
 

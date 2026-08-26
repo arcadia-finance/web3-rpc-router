@@ -13,7 +13,8 @@ logger = logging.getLogger("web3_rpc_router")
 _UNHEALTHY_AFTER_FAILURES = 3
 # Ceiling on the probe backoff for a provider that stays down, in seconds.
 _BACKOFF_MAX = 300.0
-# Guard against pointless exponentiation once a provider has been down for a long time.
+# Bound the shift so a long-dead provider cannot build a needlessly large integer
+# before ``min`` discards it.
 _BACKOFF_MAX_DOUBLINGS = 16
 
 
@@ -39,11 +40,17 @@ class HealthChecker:
         """Start the background health check loop."""
         self._task = asyncio.create_task(self._loop())
 
-    def stop(self) -> None:
-        """Cancel the background health check loop."""
-        if self._task:
-            self._task.cancel()
-            self._task = None
+    def stop(self) -> Optional[asyncio.Task]:
+        """Cancel the background loop and return its task so callers can await it.
+
+        The task is returned rather than dropped because a cycle may be mid-probe:
+        tearing down the sessions and resolver it is using before it has unwound would
+        have it fail against closed objects and write verdicts after shutdown.
+        """
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+        return task
 
     def _has_unhealthy(self) -> bool:
         """Return True if any provider across all chains is unhealthy."""
@@ -83,6 +90,7 @@ class HealthChecker:
         if not all_providers:
             return
 
+        cooldowns_at_probe_time = {id(p): p.cooldown_until for _, p in all_providers}
         results = await asyncio.gather(
             *(self._check_one(p) for _, p in all_providers),
             return_exceptions=True,
@@ -99,7 +107,12 @@ class HealthChecker:
         for chain_id, provider_results in chain_results.items():
             max_block = 0
             for p, result in provider_results:
-                if isinstance(result, Exception):
+                # Anything that is not a block number counts as a failure. Testing for
+                # Exception would miss a cancelled probe: asyncio.gather returns a
+                # CancelledError as a *result*, and it derives from BaseException, so it
+                # would be stored as last_block and make every later max() over the
+                # chain's blocks raise.
+                if not isinstance(result, int):
                     logger.warning(
                         "Health check failed for %s (chain %d): %r",
                         p.config.name,
@@ -122,9 +135,13 @@ class HealthChecker:
                     p.last_block = result
                     p.consecutive_failures = 0
                     p.next_check = 0.0
-                    # Clear any request-level cooldown: if the provider is
-                    # answering again, let the router consider it fresh.
-                    p.cooldown_until = 0.0
+                    # Clear any request-level cooldown: if the provider is answering
+                    # again, let the router consider it fresh. Only if it is the same
+                    # cooldown that was in place when this probe started, since
+                    # report_failure() can demote the provider while a probe is in
+                    # flight and that demotion must survive a stale success.
+                    if p.cooldown_until == cooldowns_at_probe_time.get(id(p)):
+                        p.cooldown_until = 0.0
                     max_block = max(max_block, result)
 
             if max_block == 0:
@@ -142,7 +159,7 @@ class HealthChecker:
 
                 if was_healthy and not p.healthy:
                     logger.warning(
-                        "Provider %s (chain %d) marked UNHEALTHY " "(block %d, max %d)",
+                        "Provider %s (chain %d) marked UNHEALTHY (block %d, max %d)",
                         p.config.name,
                         chain_id,
                         p.last_block,
@@ -170,7 +187,7 @@ class HealthChecker:
         return min(_BACKOFF_MAX, self._retry_interval * (2**doublings))
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number over its pooled async client.
+        """Query a single provider's block number over its pooled probe client.
 
         The probe runs entirely on the event loop, so a provider that misses
         ``self._timeout`` is abandoned by ``asyncio.wait_for`` leaving nothing
@@ -183,6 +200,6 @@ class HealthChecker:
         both the remaining providers' probes and real RPC traffic.
         """
         return await asyncio.wait_for(
-            p.async_w3.eth.block_number,
+            p.probe_w3.eth.block_number,
             timeout=self._timeout,
         )

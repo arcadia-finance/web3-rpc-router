@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Dict, List, Optional
 
 import aiohttp
+from aiohttp.resolver import aiodns_default
 from web3 import AsyncWeb3, Web3
 
 from web3_rpc_router.health import HealthChecker
@@ -20,21 +22,42 @@ _DEFAULT_CONNECTION_LIMIT = 100
 def _build_resolver() -> "aiohttp.abc.AbstractResolver":
     """Return a resolver that answers DNS on the event loop where possible.
 
-    Passed explicitly so the choice is visible here rather than decided by whether
-    ``aiodns`` happens to be importable. With it, aiohttp resolves via c-ares on the
-    loop. Without it, aiohttp falls back to ``ThreadedResolver``, which runs
-    ``loop.getaddrinfo()`` in asyncio's default executor: that call cannot be
-    cancelled, so a slow resolver pins a worker in the same small pool aiohttp uses
-    to decompress response bodies, and no client timeout can reclaim it.
+    Passed explicitly so the choice is visible here rather than left to whether
+    ``aiodns`` happens to be importable. With a usable aiodns, aiohttp resolves via
+    c-ares on the loop. Otherwise ``ThreadedResolver`` runs ``loop.getaddrinfo()`` in
+    asyncio's default executor: that call cannot be cancelled, so a slow resolver pins
+    a worker in the same small pool aiohttp uses to decompress response bodies, and no
+    client timeout can reclaim it.
+
+    ``aiodns_default`` is aiohttp's own capability check rather than a plain import
+    test, because an aiodns too old to expose ``getaddrinfo`` lets ``AsyncResolver()``
+    construct successfully and then fails inside ``resolve()`` with an
+    ``AttributeError`` that no failover path treats as a transport error.
+    """
+    if aiodns_default:
+        return aiohttp.AsyncResolver()
+    logger.warning(
+        "No usable aiodns; falling back to aiohttp's ThreadedResolver, which resolves "
+        "DNS in asyncio's default executor"
+    )
+    return aiohttp.ThreadedResolver()
+
+
+def _evict_cached_session(w3: AsyncWeb3) -> None:
+    """Drop any session web3 has already cached for this provider.
+
+    ``cache_async_session`` honours the session it is given only on a cache miss. If an
+    entry is already there and closed, as it is on a second ``start()`` after a
+    ``stop()``, web3 discards the session passed in and caches one of its own built with
+    ``force_close=True`` instead. That silently undoes both the connection pooling this
+    router seeds and the resolver it chose, so clear the entry first.
+
+    Best effort: the cache is web3-internal and its shape differs across web3 6 and 7.
     """
     try:
-        return aiohttp.AsyncResolver()
-    except RuntimeError:
-        logger.warning(
-            "aiodns is not installed; falling back to aiohttp's ThreadedResolver, "
-            "which resolves DNS in asyncio's default executor"
-        )
-        return aiohttp.ThreadedResolver()
+        w3.provider._request_session_manager.session_cache.clear()
+    except Exception:  # pragma: no cover - depends on web3 internals
+        logger.debug("Could not clear web3's session cache; keep-alive may not apply")
 
 
 class RPCRouter:
@@ -123,13 +146,19 @@ class RPCRouter:
                         resolver=self._resolver,
                     ),
                 )
-                await p.async_w3.provider.cache_async_session(session)
+                # Tracked before it is handed over, so a failure below still closes it.
                 self._sessions.append(session)
+                for w3 in (p.async_w3, p.probe_w3):
+                    _evict_cached_session(w3)
+                    await w3.provider.cache_async_session(session)
 
     async def stop(self) -> None:
         """Stop the background health checker, then close the sessions and resolver."""
         if self._health_checker:
-            self._health_checker.stop()
+            task = self._health_checker.stop()
+            if task is not None:
+                # Let the cancelled cycle unwind before its sessions go away.
+                await asyncio.gather(task, return_exceptions=True)
         for session in self._sessions:
             if not session.closed:
                 await session.close()
@@ -283,6 +312,11 @@ class RPCRouter:
                     "behind": max_block - p.last_block,
                     "last_check": p.last_check,
                     "cooldown_remaining": max(0.0, p.cooldown_until - now),
+                    # Probes are sparse for a provider that stays down, so last_check
+                    # alone cannot distinguish "waiting out a backoff window" from
+                    # "the health checker has stopped running".
+                    "consecutive_failures": p.consecutive_failures,
+                    "backoff_remaining": max(0.0, p.next_check - now),
                 }
                 for p in providers
             ]
@@ -299,8 +333,14 @@ class RPCRouter:
                     if p["cooldown_remaining"] > 0
                     else ""
                 )
+                backoff = (
+                    f", backoff={p['backoff_remaining']:.0f}s"
+                    f" after {p['consecutive_failures']} failures"
+                    if p["backoff_remaining"] > 0
+                    else ""
+                )
                 lines.append(
                     f"  {p['name']} (pri={p['priority']}): {health}, "
-                    f"block={p['last_block']}, behind={p['behind']}{cooldown}"
+                    f"block={p['last_block']}, behind={p['behind']}{cooldown}{backoff}"
                 )
             logger.info("Chain %d providers:\n%s", chain_id, "\n".join(lines))

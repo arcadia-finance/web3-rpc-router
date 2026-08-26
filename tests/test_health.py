@@ -8,10 +8,10 @@ from web3_rpc_router.health import HealthChecker
 
 
 class _FakeAsyncEth:
-    """Stand-in for `async_w3.eth` whose awaitable `block_number` resolves or raises.
+    """Stand-in for `probe_w3.eth` whose awaitable `block_number` resolves or raises.
 
-    `HealthChecker._check_one` awaits `p.async_w3.eth.block_number`, so the probe is
-    stubbed on the async client. `delay` simulates a provider that answers too slowly.
+    `HealthChecker._check_one` awaits `p.probe_w3.eth.block_number`, so the probe is
+    stubbed on the probe client. `delay` simulates a provider that answers too slowly.
     """
 
     def __init__(self, block_number=None, error=None, delay=0.0):
@@ -40,22 +40,22 @@ class _FakeAsyncW3:
 
 
 def _make_provider(name, priority=1, block_number=100, delay=0.0):
-    """Create a ProviderState whose async block_number probe returns `block_number`."""
+    """Create a ProviderState whose probe returns `block_number`."""
     state = ProviderState(
         config=ProviderConfig(name=name, url="http://fake", priority=priority)
     )
-    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number, delay=delay))
+    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number, delay=delay))
     return state
 
 
 def _fail_provider(state, error=None):
     """Make a provider's health check fail."""
-    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(error=error or ConnectionError("down")))
+    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(error=error or ConnectionError("down")))
 
 
 def _set_block(state, block_number):
     """Update a provider's mock block number."""
-    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number))
+    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number))
 
 
 class TestCheckAll:
@@ -393,14 +393,14 @@ class TestProbeBackoff:
         assert dead.consecutive_failures == 3
         assert dead.healthy is False
         assert dead.next_check > time.time()
-        probes_when_backoff_began = dead.async_w3.eth.calls
+        probes_when_backoff_began = dead.probe_w3.eth.calls
 
         # Further cycles must leave it alone while its window is open...
         await checker.check_all()
         await checker.check_all()
-        assert dead.async_w3.eth.calls == probes_when_backoff_began
+        assert dead.probe_w3.eth.calls == probes_when_backoff_began
         # ...while the healthy provider is still checked every cycle.
-        assert live.async_w3.eth.calls == 5
+        assert live.probe_w3.eth.calls == 5
         assert live.healthy is True
 
     @pytest.mark.asyncio
@@ -417,7 +417,8 @@ class TestProbeBackoff:
         assert p1.next_check > 0
 
         _set_block(p1, 100)
-        p1.next_check = 0.0  # the backoff window has elapsed
+        # No manual reset: p1 is the only provider and it is unhealthy, so the chain
+        # counts as dark and is probed regardless of its window.
         await checker.check_all()
 
         assert p1.healthy is True
@@ -433,7 +434,7 @@ class TestProbeBackoff:
 
         await checker.check_all()
 
-        assert p1.async_w3.eth.calls == 0
+        assert p1.probe_w3.eth.calls == 0
         assert p1.last_check == 0.0
 
     @pytest.mark.asyncio
@@ -455,11 +456,11 @@ class TestProbeBackoff:
 
         assert a.healthy is False and b.healthy is False
         assert a.next_check > time.time()  # a backoff window is open...
-        probes = a.async_w3.eth.calls
+        probes = a.probe_w3.eth.calls
 
         await checker.check_all()  # ...but the chain has nothing healthy left
 
-        assert a.async_w3.eth.calls == probes + 1
+        assert a.probe_w3.eth.calls == probes + 1
 
     @pytest.mark.asyncio
     async def test_backoff_still_applies_while_the_chain_has_a_healthy_provider(self):
@@ -474,9 +475,67 @@ class TestProbeBackoff:
 
         for _ in range(3):
             await checker.check_all()
-        probes = dead.async_w3.eth.calls
+        probes = dead.probe_w3.eth.calls
 
         await checker.check_all()
 
         assert live.healthy is True
-        assert dead.async_w3.eth.calls == probes
+        assert dead.probe_w3.eth.calls == probes
+
+
+class TestNonBlockResults:
+    """Anything a probe returns that is not a block number must count as a failure."""
+
+    @pytest.mark.asyncio
+    async def test_cancelled_probe_is_a_failure_not_a_block_number(self, monkeypatch):
+        """asyncio.gather hands back a CancelledError as a *result*, and it derives from
+        BaseException, so an ``isinstance(result, Exception)`` test would store it as
+        last_block and make every later max() over the chain's blocks raise.
+        """
+        p1 = _make_provider("a", block_number=100)
+        providers = {1: [p1]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        async def cancelled(_p):
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(checker, "_check_one", cancelled)
+        await checker.check_all()
+
+        assert p1.last_block == 0
+        assert p1.healthy is False
+        assert p1.consecutive_failures == 1
+        # The chain stays arithmetically usable.
+        assert max(q.last_block for q in providers[1]) == 0
+
+
+class TestCooldownRace:
+    @pytest.mark.asyncio
+    async def test_a_demotion_during_an_in_flight_probe_survives_it(self):
+        """report_failure() can demote a provider while its probe is in flight. A
+        success that started before the demotion must not clear it, or the router
+        re-selects the endpoint a real request just failed on.
+        """
+        p1 = _make_provider("a", block_number=100, delay=0.05)
+        providers = {1: [p1]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        cycle = asyncio.ensure_future(checker.check_all())
+        await asyncio.sleep(0.01)  # probe is in flight
+        p1.cooldown_until = time.time() + 60  # as report_failure() would
+        await cycle
+
+        assert p1.cooldown_until > time.time()
+        assert p1.healthy is True  # the probe still counted as a success
+
+    @pytest.mark.asyncio
+    async def test_a_stale_cooldown_is_still_cleared_by_a_success(self):
+        """The guard must not stop a success from clearing a cooldown it did race."""
+        p1 = _make_provider("a", block_number=100)
+        p1.cooldown_until = time.time() + 60
+        providers = {1: [p1]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        await checker.check_all()
+
+        assert p1.cooldown_until == 0.0
