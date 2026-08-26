@@ -7,46 +7,54 @@ from web3_rpc_router.provider import ProviderConfig, ProviderState
 from web3_rpc_router.health import HealthChecker
 
 
-class _FakeEth:
-    """Stand-in for `w3.eth` whose `block_number` property returns a value or raises.
+class _FakeAsyncEth:
+    """Stand-in for `async_w3.eth` whose awaitable `block_number` resolves or raises.
 
-    `HealthChecker._check_one` reads the SYNC `p.w3.eth.block_number` (via
-    `asyncio.to_thread`), so the health probe is stubbed there, not on the async client.
+    `HealthChecker._check_one` awaits `p.async_w3.eth.block_number`, so the probe is
+    stubbed on the async client. `delay` simulates a provider that answers too slowly.
     """
 
-    def __init__(self, block_number=None, error=None):
+    def __init__(self, block_number=None, error=None, delay=0.0):
         self._block_number = block_number
         self._error = error
+        self._delay = delay
 
     @property
     def block_number(self):
-        if self._error is not None:
-            raise self._error
-        return self._block_number
+        async def _probe():
+            if self._delay:
+                await asyncio.sleep(self._delay)
+            if self._error is not None:
+                raise self._error
+            return self._block_number
+
+        return _probe()
 
 
-class _FakeW3:
+class _FakeAsyncW3:
     def __init__(self, eth):
         self.eth = eth
 
 
-def _make_provider(name, priority=1, block_number=100):
-    """Create a ProviderState whose sync w3.eth.block_number returns `block_number`."""
+def _make_provider(name, priority=1, block_number=100, delay=0.0):
+    """Create a ProviderState whose async block_number probe returns `block_number`."""
     state = ProviderState(
         config=ProviderConfig(name=name, url="http://fake", priority=priority)
     )
-    state.w3 = _FakeW3(_FakeEth(block_number=block_number))
+    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number, delay=delay))
     return state
 
 
 def _fail_provider(state, error=None):
     """Make a provider's health check fail."""
-    state.w3 = _FakeW3(_FakeEth(error=error or ConnectionError("down")))
+    state.async_w3 = _FakeAsyncW3(
+        _FakeAsyncEth(error=error or ConnectionError("down"))
+    )
 
 
 def _set_block(state, block_number):
     """Update a provider's mock block number."""
-    state.w3 = _FakeW3(_FakeEth(block_number=block_number))
+    state.async_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number))
 
 
 class TestCheckAll:
@@ -253,8 +261,7 @@ class TestCooldownReset:
 
         checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
 
-        # Bypass the broken thread-based block_number probe by stubbing
-        # _check_one directly — we only care about the post-success bookkeeping.
+        # Stub the probe itself; this test only covers the post-success bookkeeping.
         async def ok(_p):
             return 100
 
@@ -302,3 +309,50 @@ class TestStartStop:
         # Give the event loop a tick to process cancellation
         await asyncio.sleep(0)
         assert checker._task is None
+
+
+class TestProbeIsolation:
+    """One hanging provider must not affect any other provider's verdict.
+
+    The probe is awaited on the event loop, so exceeding the timeout costs
+    nothing beyond that provider's own result.
+    """
+
+    @pytest.mark.asyncio
+    async def test_hanging_provider_does_not_starve_the_others(self):
+        slow = _make_provider("slow", block_number=100, delay=30)
+        fast = [_make_provider(f"fast{i}", block_number=100) for i in range(24)]
+        providers = {1: [slow, *fast]}
+
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=0.2)
+        await asyncio.wait_for(checker.check_all(), timeout=5)
+
+        assert slow.healthy is False
+        assert all(p.healthy for p in fast)
+        assert all(p.last_block == 100 for p in fast)
+
+    @pytest.mark.asyncio
+    async def test_probe_does_not_use_the_default_executor(self):
+        """asyncio's default executor is shared with aiohttp's DNS resolution and
+        response decompression. A probe that occupied a worker there could not be
+        released by the timeout, so the probe must never touch it.
+        """
+        providers = {1: [_make_provider("a", block_number=100, delay=30)]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=0.05)
+
+        loop = asyncio.get_running_loop()
+        real_run_in_executor = loop.run_in_executor
+        offloaded = []
+
+        def spy(executor, func, *args):
+            if executor is None:
+                offloaded.append(func)
+            return real_run_in_executor(executor, func, *args)
+
+        loop.run_in_executor = spy
+        try:
+            await checker.check_all()
+        finally:
+            loop.run_in_executor = real_run_in_executor
+
+        assert offloaded == []

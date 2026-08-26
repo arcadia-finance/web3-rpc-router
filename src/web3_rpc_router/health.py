@@ -123,16 +123,19 @@ class HealthChecker:
                     )
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number using sync Web3 in a thread.
+        """Query a single provider's block number over its pooled async client.
 
-        The outer ``asyncio.wait_for`` enforces ``self._timeout`` at the
-        asyncio layer — the underlying HTTPProvider has its own longer timeout
-        (``ProviderConfig.request_timeout``, default 15s), so without this
-        wrapper a flaky provider answering in e.g. 12s would still be counted
-        as "healthy". The stray thread is allowed to finish on its own; only
-        the health-check outcome is timed.
+        The probe runs entirely on the event loop, so a provider that misses
+        ``self._timeout`` is abandoned by ``asyncio.wait_for`` leaving nothing
+        behind. That matters because the underlying provider timeout
+        (``ProviderConfig.request_timeout``) is far longer than the health
+        budget: a probe offloaded to a worker thread cannot be cancelled, so it
+        would keep occupying a slot in asyncio's default executor for the full
+        request timeout. aiohttp resolves DNS and decompresses response bodies
+        in that same pool, so a handful of hanging providers there would starve
+        both the remaining providers' probes and real RPC traffic.
         """
         return await asyncio.wait_for(
-            asyncio.to_thread(lambda: p.w3.eth.block_number),
+            p.async_w3.eth.block_number,
             timeout=self._timeout,
         )
