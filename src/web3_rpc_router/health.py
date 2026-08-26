@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from typing import Dict, List, Optional
@@ -113,6 +114,27 @@ class HealthChecker:
             return_exceptions=True,
         )
 
+        # A cycle in which not one probed provider answered, while at least one
+        # of them has answered before, is overwhelmingly a local measurement gap
+        # — the event loop stalled past every probe's deadline (CPU-throttled
+        # quiet instance, heavy on-loop work) or the instance's egress dropped —
+        # not twenty independent provider outages. Recording it would strike and
+        # eventually condemn every provider for evidence that says nothing about
+        # any of them, so the cycle is discarded: no failure counts, no backoff,
+        # no verdicts. A cycle where anything answered proves the loop and the
+        # network were alive, so its failures are real evidence and are counted
+        # below. A cold start (nothing has ever answered) is not shielded:
+        # providers that never answered have no known-good state to preserve.
+        if not any(isinstance(r, int) for r in results) and any(
+            p.last_block > 0 for _, p in all_providers
+        ):
+            logger.warning(
+                "Health check cycle got no answer from any of %d providers; "
+                "treating it as a measurement gap, all verdicts stand",
+                len(all_providers),
+            )
+            return
+
         # Group results back by chain
         chain_results: Dict[int, List[tuple]] = {}
         for (chain_id, p), result in zip(all_providers, results):
@@ -212,7 +234,7 @@ class HealthChecker:
         return min(_BACKOFF_MAX, self._retry_interval * (2**doublings))
 
     async def _check_one(self, p: ProviderState) -> int:
-        """Query a single provider's block number over its pooled probe client.
+        """Query a single provider's block number over its pooled session.
 
         The probe runs entirely on the event loop, so a provider that misses
         ``self._timeout`` is abandoned by ``asyncio.wait_for`` leaving nothing
@@ -223,8 +245,30 @@ class HealthChecker:
         request timeout. aiohttp resolves DNS and decompresses response bodies
         in that same pool, so a handful of hanging providers there would starve
         both the remaining providers' probes and real RPC traffic.
+
+        The request is a plain aiohttp POST rather than a web3 call, and that is
+        load-bearing: web3 serialises every async request through one
+        process-wide ``threading.Lock`` acquired on an executor thread, and
+        cancelling a task while its acquire is in flight abandons the acquire,
+        leaving the lock held forever and every later web3 request in the
+        process blocked behind it. Probes are cancelled by design whenever a
+        provider (or a CPU-throttled instance) is slow, so they must not pass
+        through that lock at all. A cancelled aiohttp request only costs its own
+        pooled connection. See ``ProviderState.probe_session``.
         """
-        return await asyncio.wait_for(
-            p.probe_w3.eth.block_number,
-            timeout=self._timeout,
-        )
+        return await asyncio.wait_for(self._probe(p), timeout=self._timeout)
+
+    @staticmethod
+    async def _probe(p: ProviderState) -> int:
+        session = p.probe_session
+        if session is None:
+            raise RuntimeError(
+                f"provider {p.config.name} has no probe session; "
+                "RPCRouter.start() assigns it"
+            )
+        payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
+        async with session.post(p.config.url, json=payload) as resp:
+            body = await resp.read()
+        # A JSON-RPC error response has no "result"; a malformed body does not
+        # parse. Both raise here and are counted as a failed probe by check_all.
+        return int(json.loads(body)["result"], 16)

@@ -33,7 +33,18 @@ class ProviderState:
     config: ProviderConfig
     w3: Web3 = field(init=False, repr=False)
     async_w3: AsyncWeb3 = field(init=False, repr=False)
-    probe_w3: AsyncWeb3 = field(init=False, repr=False)
+    # The pooled aiohttp session the health checker probes this provider over,
+    # assigned by ``RPCRouter._init_keepalive_sessions``. It is the same session
+    # ``async_w3`` sends real traffic over, so probes measure the path real
+    # requests take and cost no extra connections. Probes speak JSON-RPC on it
+    # directly rather than through ``async_w3``: web3 serialises every async
+    # request through a process-wide ``threading.Lock`` acquired on an executor
+    # thread, and a probe cancelled by its deadline while that acquire is in
+    # flight would abandon the acquire and leave the lock held forever, wedging
+    # all real traffic in the process. A plain aiohttp request has no such
+    # cancellation hazard, and it is also one HTTP request instead of the five
+    # web3's retry policy could spend against a refusing endpoint.
+    probe_session: Any = field(default=None, repr=False)
     healthy: bool = True
     last_block: int = 0
     last_check: float = 0.0
@@ -60,20 +71,6 @@ class ProviderState:
             AsyncWeb3.AsyncHTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
-            )
-        )
-        # Health probes only, so they stay one request each. web3 retries
-        # eth_blockNumber up to five times with its own backoff, which against a
-        # refusing or rate-limited provider would spend five requests and most of the
-        # probe's timeout budget to reach a conclusion the first failure already gave.
-        # Real traffic keeps web3's retries: it goes through ``async_w3``.
-        # ``RPCRouter._init_keepalive_sessions`` points this at the same pooled session,
-        # so the extra provider costs no extra connections.
-        self.probe_w3 = AsyncWeb3(
-            AsyncWeb3.AsyncHTTPProvider(
-                self.config.url,
-                request_kwargs={"timeout": timeout},
-                exception_retry_configuration=None,
             )
         )
 
