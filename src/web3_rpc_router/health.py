@@ -161,17 +161,25 @@ class HealthChecker:
                         p.cooldown_until = 0.0
                     max_block = max(max_block, result)
 
-            if max_block == 0:
-                max_block = max((p.last_block for p, _ in provider_results), default=0)
-
-            for p, _ in provider_results:
+            # max_block is the best block any provider proved this cycle. Providers that
+            # did not answer are deliberately excluded: comparing their stale last_block
+            # against a peer's fresh one would mark a provider dead for missing a single
+            # probe, which is a measurement gap rather than evidence about the provider.
+            for p, result in provider_results:
                 was_healthy = p.healthy
-                if p.consecutive_failures >= _UNHEALTHY_AFTER_FAILURES:
+                if isinstance(result, int):
+                    # Answered, so judge it on this cycle's evidence.
+                    p.healthy = (max_block - p.last_block) <= self._max_block_lag
+                elif p.consecutive_failures >= _UNHEALTHY_AFTER_FAILURES:
+                    # Only sustained failure is evidence of death.
                     p.healthy = False
                 elif p.last_block == 0:
+                    # Never answered, so there is no known-good state to preserve and
+                    # nothing has earned it the benefit of the doubt.
                     p.healthy = False
-                else:
-                    p.healthy = (max_block - p.last_block) <= self._max_block_lag
+                # Otherwise the previous verdict stands: a provider that has proved it
+                # works does not lose its health for one missed probe, because a gap in
+                # measurement says nothing about the provider.
                 p.last_check = now
 
                 if was_healthy and not p.healthy:

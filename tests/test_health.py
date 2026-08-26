@@ -614,3 +614,77 @@ class TestCadenceVsBackoff:
         assert behind.healthy is False
         assert behind.consecutive_failures == 0 and behind.next_check == 0.0
         assert checker._has_unhealthy() is True
+
+
+class TestOneMissedProbeIsNotDeath:
+    """A dead provider must not be able to cost a working one its health.
+
+    That is the router's whole purpose, and two rules used to break it: a provider was
+    marked unhealthy for a single failure, and a provider that missed a probe had its
+    stale last_block compared against a peer's fresh one.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_proven_provider_survives_a_single_missed_probe(self):
+        good = _make_provider("good", block_number=100)
+        peer = _make_provider("peer", block_number=100)
+        providers = {1: [good, peer]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        await checker.check_all()  # both prove themselves
+        assert good.healthy is True
+
+        _fail_provider(good)  # one miss, while the peer keeps answering and advancing
+        _set_block(peer, 140)
+        await checker.check_all()
+
+        assert (
+            good.healthy is True
+        ), "one missed probe must not mark a proven provider dead"
+        assert good.consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_sustained_failure_still_marks_it_unhealthy(self):
+        good = _make_provider("good", block_number=100)
+        peer = _make_provider("peer", block_number=100)
+        providers = {1: [good, peer]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+        await checker.check_all()
+
+        _fail_provider(good)
+        for _ in range(3):
+            await checker.check_all()
+
+        assert good.healthy is False
+        assert good.consecutive_failures >= 3
+
+    @pytest.mark.asyncio
+    async def test_a_provider_that_never_answered_is_not_trusted(self):
+        """There is no known-good state to preserve, so it gets no benefit of the doubt."""
+        never = _make_provider("never")
+        _fail_provider(never)
+        providers = {1: [never]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        await checker.check_all()
+
+        assert never.healthy is False
+        assert never.last_block == 0
+
+    @pytest.mark.asyncio
+    async def test_lag_is_judged_only_on_providers_that_answered(self):
+        """A missed probe leaves last_block stale; comparing it against a peer's fresh
+        block would mark a healthy provider dead for a measurement gap."""
+        a = _make_provider("a", block_number=100)
+        b = _make_provider("b", block_number=100)
+        providers = {1: [a, b]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+        await checker.check_all()
+
+        _fail_provider(a)
+        _set_block(b, 100_000)  # peer races far ahead while a is silent
+        await checker.check_all()
+
+        assert (
+            a.healthy is True
+        ), "a stale block must not be compared against a fresh peer"
