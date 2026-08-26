@@ -52,7 +52,7 @@ def _evict_cached_session(w3: AsyncWeb3) -> None:
     ``force_close=True`` instead. That silently undoes both the connection pooling this
     router seeds and the resolver it chose, so clear the entry first.
 
-    Best effort: the cache is web3-internal and its shape differs across web3 6 and 7.
+    Best effort: the cache is web3-internal and its shape is not part of web3's API.
     """
     try:
         w3.provider._request_session_manager.session_cache.clear()
@@ -127,7 +127,7 @@ class RPCRouter:
         call then pays a fresh TCP+TLS handshake. Under the concurrency this router is
         built for (many simultaneous ``eth_call``/multicall requests sharing one
         provider) that serializes into multi-second latencies and request timeouts,
-        cascading every provider into cooldown. web3 6 pooled connections by default.
+        cascading every provider into cooldown.
 
         Pre-seeding the provider's session cache with a pooled connector restores
         connection reuse: measured ~30x faster at 50 concurrent calls.
