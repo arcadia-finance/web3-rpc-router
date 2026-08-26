@@ -151,9 +151,12 @@ class RPCRouter:
                 )
                 # Tracked before it is handed over, so a failure below still closes it.
                 self._sessions.append(session)
-                for w3 in (p.async_w3, p.probe_w3):
-                    _evict_cached_session(w3)
-                    await w3.provider.cache_async_session(session)
+                _evict_cached_session(p.async_w3)
+                await p.async_w3.provider.cache_async_session(session)
+                # The health checker probes over the same pooled session, but with
+                # plain aiohttp requests rather than through web3 — see
+                # ``ProviderState.probe_session`` for why.
+                p.probe_session = session
 
     async def stop(self) -> None:
         """Stop the background health checker, then close the sessions and resolver."""

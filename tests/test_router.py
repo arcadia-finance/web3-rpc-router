@@ -308,15 +308,21 @@ class TestResolverChoice:
         assert sessions and all(s.closed for s in sessions)
 
     @pytest.mark.asyncio
-    async def test_probe_client_does_not_retry_but_real_traffic_does(self):
-        """One probe must be one request. web3 retries eth_blockNumber five times by
-        default, which would spend five requests on a refusing provider.
+    async def test_probes_run_on_the_shared_pooled_session(self):
+        """The health checker probes over the same keep-alive session real traffic
+        uses, so probes measure the real path and cost no extra connections. Real
+        traffic keeps web3's retry policy; the probe is a single plain request.
         """
-        state = ProviderState(
-            config=ProviderConfig(name="a", url="http://a", priority=1)
-        )
-        assert state.probe_w3.provider.exception_retry_configuration is None
-        assert state.async_w3.provider.exception_retry_configuration is not None
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+
+        await router._init_keepalive_sessions()
+        try:
+            state = router._providers[1][0]
+            assert state.probe_session is router._sessions[0]
+            assert state.async_w3.provider.exception_retry_configuration is not None
+        finally:
+            await router.stop()
 
     @pytest.mark.asyncio
     async def test_restart_keeps_the_routers_own_pooled_session(self):

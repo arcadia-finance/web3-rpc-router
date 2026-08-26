@@ -1,4 +1,5 @@
 import asyncio
+import json as _json
 import time
 
 import pytest
@@ -7,11 +8,20 @@ from web3_rpc_router.provider import ProviderConfig, ProviderState
 from web3_rpc_router.health import HealthChecker
 
 
-class _FakeAsyncEth:
-    """Stand-in for `probe_w3.eth` whose awaitable `block_number` resolves or raises.
+class _FakeResponse:
+    def __init__(self, body: bytes):
+        self._body = body
 
-    `HealthChecker._check_one` awaits `p.probe_w3.eth.block_number`, so the probe is
-    stubbed on the probe client. `delay` simulates a provider that answers too slowly.
+    async def read(self) -> bytes:
+        return self._body
+
+
+class _FakeProbeSession:
+    """Stand-in for the pooled aiohttp session `HealthChecker._probe` posts on.
+
+    `post()` returns an async context manager, like aiohttp's, whose response body
+    is a JSON-RPC blockNumber result. `delay` simulates a provider that answers too
+    slowly; `error` a transport failure.
     """
 
     def __init__(self, block_number=None, error=None, delay=0.0):
@@ -20,23 +30,25 @@ class _FakeAsyncEth:
         self._delay = delay
         self.calls = 0
 
-    @property
-    def block_number(self):
+    def post(self, url, json=None):
         self.calls += 1
+        fake = self
 
-        async def _probe():
-            if self._delay:
-                await asyncio.sleep(self._delay)
-            if self._error is not None:
-                raise self._error
-            return self._block_number
+        class _Ctx:
+            async def __aenter__(self):
+                if fake._delay:
+                    await asyncio.sleep(fake._delay)
+                if fake._error is not None:
+                    raise fake._error
+                body = _json.dumps(
+                    {"jsonrpc": "2.0", "id": 1, "result": hex(fake._block_number)}
+                ).encode()
+                return _FakeResponse(body)
 
-        return _probe()
+            async def __aexit__(self, *exc):
+                return False
 
-
-class _FakeAsyncW3:
-    def __init__(self, eth):
-        self.eth = eth
+        return _Ctx()
 
 
 def _make_provider(name, priority=1, block_number=100, delay=0.0):
@@ -44,18 +56,18 @@ def _make_provider(name, priority=1, block_number=100, delay=0.0):
     state = ProviderState(
         config=ProviderConfig(name=name, url="http://fake", priority=priority)
     )
-    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number, delay=delay))
+    state.probe_session = _FakeProbeSession(block_number=block_number, delay=delay)
     return state
 
 
 def _fail_provider(state, error=None):
     """Make a provider's health check fail."""
-    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(error=error or ConnectionError("down")))
+    state.probe_session = _FakeProbeSession(error=error or ConnectionError("down"))
 
 
 def _set_block(state, block_number):
     """Update a provider's mock block number."""
-    state.probe_w3 = _FakeAsyncW3(_FakeAsyncEth(block_number=block_number))
+    state.probe_session = _FakeProbeSession(block_number=block_number)
 
 
 class TestCheckAll:
@@ -393,14 +405,14 @@ class TestProbeBackoff:
         assert dead.consecutive_failures == 3
         assert dead.healthy is False
         assert dead.next_check > time.time()
-        probes_when_backoff_began = dead.probe_w3.eth.calls
+        probes_when_backoff_began = dead.probe_session.calls
 
         # Further cycles must leave it alone while its window is open...
         await checker.check_all()
         await checker.check_all()
-        assert dead.probe_w3.eth.calls == probes_when_backoff_began
+        assert dead.probe_session.calls == probes_when_backoff_began
         # ...while the healthy provider is still checked every cycle.
-        assert live.probe_w3.eth.calls == 5
+        assert live.probe_session.calls == 5
         assert live.healthy is True
 
     @pytest.mark.asyncio
@@ -434,7 +446,7 @@ class TestProbeBackoff:
 
         await checker.check_all()
 
-        assert p1.probe_w3.eth.calls == 0
+        assert p1.probe_session.calls == 0
         assert p1.last_check == 0.0
 
     @pytest.mark.asyncio
@@ -456,11 +468,11 @@ class TestProbeBackoff:
 
         assert a.healthy is False and b.healthy is False
         assert a.next_check > time.time()  # a backoff window is open...
-        probes = a.probe_w3.eth.calls
+        probes = a.probe_session.calls
 
         await checker.check_all()  # ...but the chain has nothing healthy left
 
-        assert a.probe_w3.eth.calls == probes + 1
+        assert a.probe_session.calls == probes + 1
 
     @pytest.mark.asyncio
     async def test_backoff_still_applies_while_the_chain_has_a_healthy_provider(self):
@@ -475,12 +487,12 @@ class TestProbeBackoff:
 
         for _ in range(3):
             await checker.check_all()
-        probes = dead.probe_w3.eth.calls
+        probes = dead.probe_session.calls
 
         await checker.check_all()
 
         assert live.healthy is True
-        assert dead.probe_w3.eth.calls == probes
+        assert dead.probe_session.calls == probes
 
 
 class TestNonBlockResults:
@@ -688,3 +700,128 @@ class TestOneMissedProbeIsNotDeath:
         assert (
             a.healthy is True
         ), "a stale block must not be compared against a fresh peer"
+
+
+class TestMeasurementGap:
+    """A cycle in which nothing answered is evidence about the instance, not the
+    providers: the loop was stalled past every deadline or egress was down. It must
+    not strike, back off, or condemn anyone — while a cycle where anything answered
+    keeps its failures as real evidence.
+    """
+
+    @pytest.mark.asyncio
+    async def test_total_blackout_leaves_all_verdicts_standing(self):
+        a = _make_provider("a", block_number=100)
+        b = _make_provider("b", block_number=100)
+        providers = {1: [a, b]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+        await checker.check_all()
+        assert a.healthy and b.healthy
+
+        _fail_provider(a, asyncio.TimeoutError())
+        _fail_provider(b, asyncio.TimeoutError())
+        for _ in range(5):  # well past the 3-strike threshold
+            await checker.check_all()
+
+        assert a.healthy is True and b.healthy is True
+        assert a.consecutive_failures == 0 and b.consecutive_failures == 0
+        assert a.next_check == 0.0 and b.next_check == 0.0
+
+    @pytest.mark.asyncio
+    async def test_blackout_spanning_chains_is_still_one_gap(self):
+        a = _make_provider("a", block_number=100)
+        b = _make_provider("b", block_number=200)
+        providers = {1: [a], 2: [b]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+        await checker.check_all()
+
+        _fail_provider(a, asyncio.TimeoutError())
+        _fail_provider(b, asyncio.TimeoutError())
+        for _ in range(4):
+            await checker.check_all()
+
+        assert a.healthy is True and b.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_cold_start_blackout_is_not_shielded(self):
+        """Nothing has ever answered, so there is no known-good state to preserve."""
+        a = _make_provider("a")
+        b = _make_provider("b")
+        _fail_provider(a)
+        _fail_provider(b)
+        providers = {1: [a, b]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+
+        await checker.check_all()
+
+        assert a.healthy is False and b.healthy is False
+        assert a.consecutive_failures == 1
+
+    @pytest.mark.asyncio
+    async def test_partial_failure_still_counts_as_evidence(self):
+        """Something answered, so the loop and the network were alive: a provider
+        that failed that same cycle really failed."""
+        dead = _make_provider("dead", block_number=100)
+        live = _make_provider("live", block_number=100)
+        providers = {1: [dead, live]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+        await checker.check_all()
+
+        _fail_provider(dead)
+        for _ in range(3):
+            await checker.check_all()
+            _set_block(live, 100)
+
+        assert live.healthy is True
+        assert dead.healthy is False
+        assert dead.consecutive_failures == 3
+
+    @pytest.mark.asyncio
+    async def test_a_gap_does_not_clear_cooldowns(self):
+        p1 = _make_provider("a", block_number=100)
+        providers = {1: [p1]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+        await checker.check_all()
+
+        target = time.time() + 120
+        p1.cooldown_until = target
+        _fail_provider(p1, asyncio.TimeoutError())
+        await checker.check_all()
+
+        assert p1.cooldown_until == target
+
+
+class TestProbeResponseParsing:
+    @pytest.mark.asyncio
+    async def test_a_json_rpc_error_response_is_a_failed_probe(self):
+        """A provider that answers HTTP 200 with {"error": ...} did not prove a
+        block number; it must count as a failure, not parse as a success."""
+        live = _make_provider("live", block_number=100)
+        broken = _make_provider("broken", block_number=100)
+
+        class _ErrorSession(_FakeProbeSession):
+            def post(self, url, json=None):
+                self.calls += 1
+
+                class _Ctx:
+                    async def __aenter__(self):
+                        return _FakeResponse(
+                            b'{"jsonrpc":"2.0","id":1,'
+                            b'"error":{"code":-32005,"message":"rate limited"}}'
+                        )
+
+                    async def __aexit__(self, *exc):
+                        return False
+
+                return _Ctx()
+
+        broken.probe_session = _ErrorSession()
+        providers = {1: [live, broken]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
+
+        await checker.check_all()
+
+        assert live.healthy is True
+        assert broken.healthy is False
+        assert broken.consecutive_failures == 1
+        assert broken.last_block == 0
