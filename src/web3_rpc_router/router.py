@@ -19,28 +19,29 @@ logger = logging.getLogger("web3_rpc_router")
 _DEFAULT_CONNECTION_LIMIT = 100
 
 
-def _build_resolver() -> "aiohttp.abc.AbstractResolver":
-    """Return a resolver that answers DNS on the event loop where possible.
+def _build_resolver(use_async_dns: bool) -> "aiohttp.abc.AbstractResolver":
+    """Return the DNS resolver for every pooled session.
 
-    Passed explicitly so the choice is visible here rather than left to whether
-    ``aiodns`` happens to be importable. With a usable aiodns, aiohttp resolves via
-    c-ares on the loop. Otherwise ``ThreadedResolver`` runs ``loop.getaddrinfo()`` in
-    asyncio's default executor: that call cannot be cancelled, so a slow resolver pins
-    a worker in the same small pool aiohttp uses to decompress response bodies, and no
-    client timeout can reclaim it.
+    Defaults to ``ThreadedResolver`` because it is the only one whose behaviour under
+    concurrency is known here. Measured against a shared ``AsyncResolver``, which funnels
+    every lookup in the process through one c-ares channel, p50 per lookup was 24ms / 34ms
+    / 77ms at 5 / 20 / 50 concurrent, while ``ThreadedResolver`` held 23ms / 4.7ms / 9.7ms.
+    Since a lookup is what a new connection waits on, that degradation lands on exactly the
+    requests that cannot reuse a warm connection.
 
-    ``aiodns_default`` is aiohttp's own capability check rather than a plain import
-    test, because an aiodns too old to expose ``getaddrinfo`` lets ``AsyncResolver()``
-    construct successfully and then fails inside ``resolve()`` with an
-    ``AttributeError`` that no failover path treats as a transport error.
+    ``use_async_dns`` has to be asked for explicitly. Selecting c-ares merely because
+    ``aiodns`` became importable makes adding a dependency change production DNS with no
+    diff to review.
     """
-    if aiodns_default:
-        return aiohttp.AsyncResolver()
-    logger.warning(
-        "No usable aiodns; falling back to aiohttp's ThreadedResolver, which resolves "
-        "DNS in asyncio's default executor"
-    )
-    return aiohttp.ThreadedResolver()
+    if not use_async_dns:
+        return aiohttp.ThreadedResolver()
+    if not aiodns_default:
+        logger.warning(
+            "use_async_dns was requested but there is no usable aiodns; falling back to "
+            "ThreadedResolver"
+        )
+        return aiohttp.ThreadedResolver()
+    return aiohttp.AsyncResolver()
 
 
 def _evict_cached_session(w3: AsyncWeb3) -> None:
@@ -83,12 +84,14 @@ class RPCRouter:
         health_check_timeout: float = 5.0,
         retry_interval: float = 30.0,
         connection_limit: int = _DEFAULT_CONNECTION_LIMIT,
+        use_async_dns: bool = False,
     ) -> None:
         self._check_interval = check_interval
         self._max_block_lag = max_block_lag
         self._health_check_timeout = health_check_timeout
         self._retry_interval = retry_interval
         self._connection_limit = connection_limit
+        self._use_async_dns = use_async_dns
         self._providers: Dict[int, List[ProviderState]] = {}
         self._sessions: List[aiohttp.ClientSession] = []
         self._resolver: Optional["aiohttp.abc.AbstractResolver"] = None
@@ -136,7 +139,7 @@ class RPCRouter:
         # borrower rather than an owner (it only closes a resolver it built itself), so the
         # router closes this one in stop(); a per-session resolver would leak a registration
         # in aiohttp's shared DNS resolver manager on every start/stop cycle.
-        self._resolver = _build_resolver()
+        self._resolver = _build_resolver(self._use_async_dns)
         for providers in self._providers.values():
             for p in providers:
                 session = aiohttp.ClientSession(

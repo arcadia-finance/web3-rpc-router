@@ -247,11 +247,28 @@ class TestResolverChoice:
     """Sessions must get a resolver explicitly, and must still build without aiodns."""
 
     @pytest.mark.asyncio
-    async def test_build_resolver_degrades_instead_of_raising(self):
+    async def test_defaults_to_threaded_resolver(self):
+        """The only resolver whose behaviour under concurrency is known here. A shared
+        AsyncResolver funnels every lookup through one c-ares channel and degrades as
+        concurrency rises, which lands on exactly the requests needing a new connection.
+        """
         from web3_rpc_router.router import _build_resolver
 
-        resolver = _build_resolver()
-        assert isinstance(resolver, (aiohttp.AsyncResolver, aiohttp.ThreadedResolver))
+        assert isinstance(_build_resolver(False), aiohttp.ThreadedResolver)
+
+    @pytest.mark.asyncio
+    async def test_async_dns_must_be_asked_for_explicitly(self):
+        """Picking c-ares because aiodns became importable changes production DNS with no
+        diff to review."""
+        from web3_rpc_router.router import _build_resolver, aiodns_default
+
+        resolver = _build_resolver(True)
+        expected = aiohttp.AsyncResolver if aiodns_default else aiohttp.ThreadedResolver
+        assert isinstance(resolver, expected)
+
+    @pytest.mark.asyncio
+    async def test_router_does_not_opt_into_async_dns_by_default(self):
+        assert RPCRouter()._use_async_dns is False
 
     @pytest.mark.asyncio
     async def test_keepalive_sessions_get_a_resolver(self):
