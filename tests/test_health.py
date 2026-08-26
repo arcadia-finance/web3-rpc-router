@@ -539,3 +539,78 @@ class TestCooldownRace:
         await checker.check_all()
 
         assert p1.cooldown_until == 0.0
+
+
+class TestCadenceVsBackoff:
+    """A dead provider must not hold every chain at the fast retry cadence."""
+
+    @pytest.mark.asyncio
+    async def test_a_backed_off_provider_releases_the_fast_cadence(self):
+        dead = _make_provider("dead")
+        _fail_provider(dead)
+        live = _make_provider("live", block_number=100)
+        providers = {1: [dead, live]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+
+        assert dead.healthy is False
+        assert dead.next_check > time.time()
+        # Its window is open, so nothing is waiting on it: use the full interval.
+        assert checker._has_unhealthy() is False
+
+    @pytest.mark.asyncio
+    async def test_the_fast_cadence_returns_once_the_window_expires(self):
+        dead = _make_provider("dead")
+        _fail_provider(dead)
+        live = _make_provider("live", block_number=100)
+        providers = {1: [dead, live]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+        assert checker._has_unhealthy() is False
+
+        dead.next_check = 0.0  # window elapsed, it is due again
+        assert checker._has_unhealthy() is True
+
+    @pytest.mark.asyncio
+    async def test_a_dark_chain_keeps_the_fast_cadence(self):
+        """Its providers are probed regardless of their windows, so the cadence must
+        match: this is the case where recovery matters most.
+        """
+        a = _make_provider("a")
+        b = _make_provider("b")
+        _fail_provider(a)
+        _fail_provider(b)
+        providers = {1: [a, b]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+
+        assert a.next_check > time.time() and b.next_check > time.time()
+        assert checker._has_unhealthy() is True
+
+    @pytest.mark.asyncio
+    async def test_a_lagging_but_responsive_provider_keeps_the_fast_cadence(self):
+        """It answers, so it never backs off, and it may yet catch up."""
+        ahead = _make_provider("ahead", block_number=100)
+        behind = _make_provider("behind", block_number=50)
+        providers = {1: [ahead, behind]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        await checker.check_all()
+
+        assert behind.healthy is False
+        assert behind.consecutive_failures == 0 and behind.next_check == 0.0
+        assert checker._has_unhealthy() is True

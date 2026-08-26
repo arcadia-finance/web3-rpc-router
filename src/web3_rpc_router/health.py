@@ -52,11 +52,34 @@ class HealthChecker:
             task.cancel()
         return task
 
+    def _due_providers(self, now: float) -> List[tuple]:
+        """``(chain_id, provider)`` pairs to probe on this cycle.
+
+        A provider inside an open backoff window is skipped, unless its chain has no
+        healthy provider left. Such a chain is being served in degraded mode via
+        ``providers[0]``, so noticing any recovery outweighs sparing a dead endpoint,
+        and waiting out a capped window there would leave selection pinned even after
+        another provider started answering.
+        """
+        due: List[tuple] = []
+        for chain_id, providers in self._providers.items():
+            chain_is_dark = not any(p.healthy for p in providers)
+            due.extend(
+                (chain_id, p) for p in providers if chain_is_dark or p.next_check <= now
+            )
+        return due
+
     def _has_unhealthy(self) -> bool:
-        """Return True if any provider across all chains is unhealthy."""
-        return any(
-            not p.healthy for providers in self._providers.values() for p in providers
-        )
+        """Return True while an unhealthy provider is due to be probed again.
+
+        This picks the loop's cadence. The shorter ``retry_interval`` exists to bring a
+        provider back quickly, so a provider whose backoff window is still open must not
+        hold the whole fleet at it: otherwise a single permanently dead endpoint pins
+        every chain to ``retry_interval`` for the life of the process. Reading the same
+        due list ``check_all`` will act on keeps the cadence matched to the work, so a
+        chain with nothing healthy still gets the fast cadence it needs.
+        """
+        return any(not p.healthy for _, p in self._due_providers(time.time()))
 
     async def _loop(self) -> None:
         while True:
@@ -80,13 +103,7 @@ class HealthChecker:
         sparing a dead endpoint, and waiting out a capped window there would leave
         selection stuck on ``providers[0]`` even once another provider recovered.
         """
-        due = time.time()
-        all_providers = []
-        for chain_id, providers in self._providers.items():
-            chain_is_dark = not any(p.healthy for p in providers)
-            all_providers.extend(
-                (chain_id, p) for p in providers if chain_is_dark or p.next_check <= due
-            )
+        all_providers = self._due_providers(time.time())
         if not all_providers:
             return
 
