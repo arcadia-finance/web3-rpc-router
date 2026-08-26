@@ -9,6 +9,13 @@ from web3_rpc_router.provider import ProviderState
 
 logger = logging.getLogger("web3_rpc_router")
 
+# Consecutive failed health checks a provider is allowed before it is considered down.
+_UNHEALTHY_AFTER_FAILURES = 3
+# Ceiling on the probe backoff for a provider that stays down, in seconds.
+_BACKOFF_MAX = 300.0
+# Guard against pointless exponentiation once a provider has been down for a long time.
+_BACKOFF_MAX_DOUBLINGS = 16
+
 
 class HealthChecker:
     """Background task that periodically checks provider health via block number."""
@@ -54,13 +61,23 @@ class HealthChecker:
                 logger.exception("Health check cycle failed")
 
     async def check_all(self) -> None:
-        """Check all providers across all chains in parallel."""
-        # Check all providers across all chains concurrently
+        """Check every provider that is due, across all chains, in parallel.
+
+        A provider that has failed enough consecutive checks earns a backoff window
+        and is skipped until it expires, so a permanently dead endpoint costs one
+        probe per ``_BACKOFF_MAX`` instead of one per cycle. Its existing verdict
+        stands while it is skipped, and one successful check clears the backoff.
+        """
+        due = time.time()
         all_providers = [
             (chain_id, p)
             for chain_id, providers in self._providers.items()
             for p in providers
+            if p.next_check <= due
         ]
+        if not all_providers:
+            return
+
         results = await asyncio.gather(
             *(self._check_one(p) for _, p in all_providers),
             return_exceptions=True,
@@ -70,6 +87,8 @@ class HealthChecker:
         chain_results: Dict[int, List[tuple]] = {}
         for (chain_id, p), result in zip(all_providers, results):
             chain_results.setdefault(chain_id, []).append((p, result))
+
+        now = time.time()
 
         # Process results per chain
         for chain_id, provider_results in chain_results.items():
@@ -82,10 +101,22 @@ class HealthChecker:
                         chain_id,
                         result,
                     )
-                    p._consecutive_failures = getattr(p, "_consecutive_failures", 0) + 1
+                    p.consecutive_failures += 1
+                    backoff = self._backoff_delay(p.consecutive_failures)
+                    p.next_check = now + backoff
+                    if backoff:
+                        logger.debug(
+                            "Provider %s (chain %d) backing off %.0fs after %d "
+                            "consecutive failures",
+                            p.config.name,
+                            chain_id,
+                            backoff,
+                            p.consecutive_failures,
+                        )
                 else:
                     p.last_block = result
-                    p._consecutive_failures = 0
+                    p.consecutive_failures = 0
+                    p.next_check = 0.0
                     # Clear any request-level cooldown: if the provider is
                     # answering again, let the router consider it fresh.
                     p.cooldown_until = 0.0
@@ -94,11 +125,9 @@ class HealthChecker:
             if max_block == 0:
                 max_block = max((p.last_block for p, _ in provider_results), default=0)
 
-            now = time.time()
             for p, _ in provider_results:
                 was_healthy = p.healthy
-                failures = getattr(p, "_consecutive_failures", 0)
-                if failures >= 3:
+                if p.consecutive_failures >= _UNHEALTHY_AFTER_FAILURES:
                     p.healthy = False
                 elif p.last_block == 0:
                     p.healthy = False
@@ -121,6 +150,19 @@ class HealthChecker:
                         chain_id,
                         p.last_block,
                     )
+
+    def _backoff_delay(self, failures: int) -> float:
+        """Seconds to skip a provider that has failed ``failures`` checks in a row.
+
+        Zero while a provider is still within its allowance, so a brief blip is
+        retried on the normal cadence. Past that the wait doubles each failure up to
+        ``_BACKOFF_MAX``, which keeps a dead endpoint from being probed every cycle
+        while still recovering it within one capped window of coming back.
+        """
+        if failures < _UNHEALTHY_AFTER_FAILURES:
+            return 0.0
+        doublings = min(failures - _UNHEALTHY_AFTER_FAILURES, _BACKOFF_MAX_DOUBLINGS)
+        return min(_BACKOFF_MAX, self._retry_interval * (2**doublings))
 
     async def _check_one(self, p: ProviderState) -> int:
         """Query a single provider's block number over its pooled async client.

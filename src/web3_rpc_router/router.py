@@ -17,6 +17,26 @@ logger = logging.getLogger("web3_rpc_router")
 _DEFAULT_CONNECTION_LIMIT = 100
 
 
+def _build_resolver() -> "aiohttp.abc.AbstractResolver":
+    """Return a resolver that answers DNS on the event loop where possible.
+
+    Passed explicitly so the choice is visible here rather than decided by whether
+    ``aiodns`` happens to be importable. With it, aiohttp resolves via c-ares on the
+    loop. Without it, aiohttp falls back to ``ThreadedResolver``, which runs
+    ``loop.getaddrinfo()`` in asyncio's default executor: that call cannot be
+    cancelled, so a slow resolver pins a worker in the same small pool aiohttp uses
+    to decompress response bodies, and no client timeout can reclaim it.
+    """
+    try:
+        return aiohttp.AsyncResolver()
+    except RuntimeError:
+        logger.warning(
+            "aiodns is not installed; falling back to aiohttp's ThreadedResolver, "
+            "which resolves DNS in asyncio's default executor"
+        )
+        return aiohttp.ThreadedResolver()
+
+
 class RPCRouter:
     """Multi-provider RPC router with health-based selection.
 
@@ -92,7 +112,10 @@ class RPCRouter:
             for p in providers:
                 session = aiohttp.ClientSession(
                     raise_for_status=True,
-                    connector=aiohttp.TCPConnector(limit=self._connection_limit),
+                    connector=aiohttp.TCPConnector(
+                        limit=self._connection_limit,
+                        resolver=_build_resolver(),
+                    ),
                 )
                 await p.async_w3.provider.cache_async_session(session)
                 self._sessions.append(session)

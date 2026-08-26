@@ -18,9 +18,12 @@ class _FakeAsyncEth:
         self._block_number = block_number
         self._error = error
         self._delay = delay
+        self.calls = 0
 
     @property
     def block_number(self):
+        self.calls += 1
+
         async def _probe():
             if self._delay:
                 await asyncio.sleep(self._delay)
@@ -356,3 +359,81 @@ class TestProbeIsolation:
             loop.run_in_executor = real_run_in_executor
 
         assert offloaded == []
+
+
+class TestProbeBackoff:
+    """A provider that stays down must be probed progressively less often.
+
+    Every provider is otherwise probed on every cycle, so a permanently dead
+    endpoint would be polled for as long as it stays configured.
+    """
+
+    def test_backoff_delay_progression(self):
+        checker = HealthChecker(
+            {}, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+        assert checker._backoff_delay(0) == 0.0
+        assert checker._backoff_delay(2) == 0.0  # still within its allowance
+        assert checker._backoff_delay(3) == 30.0
+        assert checker._backoff_delay(4) == 60.0
+        assert checker._backoff_delay(5) == 120.0
+        assert checker._backoff_delay(99) == 300.0  # capped
+
+    @pytest.mark.asyncio
+    async def test_dead_provider_is_skipped_once_backing_off(self):
+        dead = _make_provider("dead")
+        _fail_provider(dead)
+        live = _make_provider("live", block_number=100)
+        providers = {1: [dead, live]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+
+        assert dead.consecutive_failures == 3
+        assert dead.healthy is False
+        assert dead.next_check > time.time()
+        probes_when_backoff_began = dead.async_w3.eth.calls
+
+        # Further cycles must leave it alone while its window is open...
+        await checker.check_all()
+        await checker.check_all()
+        assert dead.async_w3.eth.calls == probes_when_backoff_began
+        # ...while the healthy provider is still checked every cycle.
+        assert live.async_w3.eth.calls == 5
+        assert live.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_recovery_clears_the_backoff(self):
+        p1 = _make_provider("a")
+        _fail_provider(p1)
+        providers = {1: [p1]}
+        checker = HealthChecker(
+            providers, interval=60, max_block_lag=1, timeout=5, retry_interval=30
+        )
+
+        for _ in range(3):
+            await checker.check_all()
+        assert p1.next_check > 0
+
+        _set_block(p1, 100)
+        p1.next_check = 0.0  # the backoff window has elapsed
+        await checker.check_all()
+
+        assert p1.healthy is True
+        assert p1.consecutive_failures == 0
+        assert p1.next_check == 0.0
+
+    @pytest.mark.asyncio
+    async def test_cycle_is_a_noop_when_every_provider_is_backing_off(self):
+        p1 = _make_provider("a", block_number=100)
+        p1.next_check = time.time() + 300
+        providers = {1: [p1]}
+        checker = HealthChecker(providers, interval=60, max_block_lag=1, timeout=5)
+
+        await checker.check_all()
+
+        assert p1.async_w3.eth.calls == 0
+        assert p1.last_check == 0.0

@@ -40,6 +40,12 @@ class ProviderState:
     # failure reported via RPCRouter.report_failure(). Cleared by a successful
     # background health check.
     cooldown_until: float = 0.0
+    # Consecutive failed health checks. Drives both the unhealthy verdict and the
+    # probe backoff. Reset to 0 by a successful check.
+    consecutive_failures: int = 0
+    # Epoch seconds before which the background checker skips probing this provider,
+    # so a provider that stays down is polled progressively less often.
+    next_check: float = 0.0
 
     def __post_init__(self) -> None:
         timeout = self.config.request_timeout

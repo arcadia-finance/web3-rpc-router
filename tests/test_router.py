@@ -1,5 +1,6 @@
 import time
 
+import aiohttp
 import pytest
 
 from web3_rpc_router import RPCRouter, ProviderConfig
@@ -240,3 +241,27 @@ class TestGetProviderStatus:
     def test_empty_for_unknown_chain(self):
         router = RPCRouter()
         assert router.get_provider_status(999) == []
+
+
+class TestResolverChoice:
+    """Sessions must get a resolver explicitly, and must still build without aiodns."""
+
+    @pytest.mark.asyncio
+    async def test_build_resolver_degrades_instead_of_raising(self):
+        from web3_rpc_router.router import _build_resolver
+
+        resolver = _build_resolver()
+        assert isinstance(resolver, (aiohttp.AsyncResolver, aiohttp.ThreadedResolver))
+
+    @pytest.mark.asyncio
+    async def test_keepalive_sessions_get_a_resolver(self):
+        router = RPCRouter()
+        router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+        await router._init_keepalive_sessions()
+        try:
+            assert router._sessions
+            for session in router._sessions:
+                assert session.connector._resolver is not None
+        finally:
+            for session in router._sessions:
+                await session.close()
