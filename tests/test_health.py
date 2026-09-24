@@ -791,6 +791,57 @@ class TestMeasurementGap:
         assert p1.cooldown_until == target
 
 
+class _LoopBlockingSession(_FakeProbeSession):
+    """Answers, but first blocks the whole event loop, like a throttled CPU does."""
+
+    def __init__(self, block_number, block_seconds):
+        super().__init__(block_number=block_number)
+        self._block_seconds = block_seconds
+
+    def post(self, url, json=None):
+        time.sleep(self._block_seconds)
+        return super().post(url, json=json)
+
+
+class TestStalledLoop:
+    """A partial cycle on a CPU-throttled instance: a few probes answer while the rest
+    only see their timeouts fire long after the deadline. Those timeouts measured the
+    instance, not the provider, and must not strike it.
+    """
+
+    @pytest.mark.asyncio
+    async def test_timeout_that_fired_late_does_not_strike(self):
+        hanging = _make_provider("hanging", block_number=100)
+        await HealthChecker({1: [hanging]}, interval=60, max_block_lag=5, timeout=5).check_all()
+        assert hanging.healthy and hanging.last_block == 100
+
+        hanging.probe_session = _FakeProbeSession(block_number=100, delay=30)
+        blocker = _make_provider("blocker", block_number=101)
+        # Probed after `hanging`: it stalls the loop for 4x the timeout, so the
+        # hanging probe's timer can only fire long after its deadline.
+        blocker.probe_session = _LoopBlockingSession(block_number=101, block_seconds=0.2)
+        checker = HealthChecker(
+            {1: [hanging, blocker]}, interval=60, max_block_lag=5, timeout=0.05
+        )
+        last_check = hanging.last_check
+        await checker.check_all()
+
+        assert hanging.consecutive_failures == 0
+        assert hanging.healthy is True
+        assert hanging.last_check == last_check
+        assert blocker.last_block == 101 and blocker.healthy
+
+    @pytest.mark.asyncio
+    async def test_timeout_on_a_running_loop_still_strikes(self):
+        """Without a stall the timeout fires on time and is real evidence."""
+        hanging = _make_provider("hanging", block_number=100, delay=30)
+        ok = _make_provider("ok", block_number=100)
+        checker = HealthChecker({1: [hanging, ok]}, interval=60, max_block_lag=5, timeout=0.05)
+        await checker.check_all()
+
+        assert hanging.consecutive_failures == 1
+
+
 class TestProbeResponseParsing:
     @pytest.mark.asyncio
     async def test_a_json_rpc_error_response_is_a_failed_probe(self):

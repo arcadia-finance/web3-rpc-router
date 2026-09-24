@@ -17,6 +17,13 @@ _BACKOFF_MAX = 300.0
 # Bound the shift so a long-dead provider cannot build a needlessly large integer
 # before ``min`` discards it.
 _BACKOFF_MAX_DOUBLINGS = 16
+# A probe that timed out only after this multiple of its timeout had passed was not
+# timed out by its provider: the event loop could not run the timer on time.
+_STALL_FACTOR = 2.0
+
+
+class _LoopStalled(Exception):
+    """A probe's timeout fired late, so its result says nothing about the provider."""
 
 
 class HealthChecker:
@@ -110,7 +117,7 @@ class HealthChecker:
 
         cooldowns_at_probe_time = {id(p): p.cooldown_until for _, p in all_providers}
         results = await asyncio.gather(
-            *(self._check_one(p) for _, p in all_providers),
+            *(self._check_one_or_gap(p) for _, p in all_providers),
             return_exceptions=True,
         )
 
@@ -135,9 +142,25 @@ class HealthChecker:
             )
             return
 
+        # A probe whose timeout fired late is the same measurement gap for one provider:
+        # on a CPU-throttled instance a request can wake the loop so that a few probes
+        # answer while the rest see their long-overdue timers fire. Those are dropped
+        # from the cycle like a blackout: no strike, no backoff, verdict and last_check
+        # untouched. The answers that did arrive are still used.
+        stalled = sum(isinstance(r, _LoopStalled) for r in results)
+        if stalled:
+            logger.warning(
+                "Health check: %d of %d probes timed out late (event loop stalled); "
+                "not counting them",
+                stalled,
+                len(all_providers),
+            )
+
         # Group results back by chain
         chain_results: Dict[int, List[tuple]] = {}
         for (chain_id, p), result in zip(all_providers, results):
+            if isinstance(result, _LoopStalled):
+                continue
             chain_results.setdefault(chain_id, []).append((p, result))
 
         now = time.time()
@@ -232,6 +255,22 @@ class HealthChecker:
             return 0.0
         doublings = min(failures - _UNHEALTHY_AFTER_FAILURES, _BACKOFF_MAX_DOUBLINGS)
         return min(_BACKOFF_MAX, self._retry_interval * (2**doublings))
+
+    async def _check_one_or_gap(self, p: ProviderState) -> int:
+        """``_check_one``, raising ``_LoopStalled`` for a timeout that fired late.
+
+        ``wait_for`` cancels a probe at its deadline only if the loop gets to run the
+        timer. When the timeout is observed well past the deadline, the loop was not
+        running (throttled CPU, blocking work), so the timeout measured the instance,
+        not the provider.
+        """
+        started = time.monotonic()
+        try:
+            return await self._check_one(p)
+        except asyncio.TimeoutError:
+            if time.monotonic() - started > self._timeout * _STALL_FACTOR:
+                raise _LoopStalled() from None
+            raise
 
     async def _check_one(self, p: ProviderState) -> int:
         """Query a single provider's block number over its pooled session.
