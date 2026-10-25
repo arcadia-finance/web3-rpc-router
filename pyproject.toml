@@ -1,21 +1,35 @@
-[tool.poetry]
+[project]
 name = "web3-rpc-router"
-version = "0.4.2"
+version = "0.5.0"
 description = "Multi-provider RPC routing for web3.py with health checking"
-authors = []
-packages = [{include = "web3_rpc_router", from = "src"}]
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp>=3.14.3",
+    "requests>=2.34.2",
+    "web3>=8.0.0",
+]
 
-[tool.poetry.dependencies]
-python = "^3.12"
-# web3 7 only: the health probe passes exception_retry_configuration to
-# AsyncHTTPProvider, which web3 6 does not accept, and _init_keepalive_sessions exists
-# to undo web3 7's force_close connector.
-web3 = ">=7,<8"
-
-[tool.poetry.group.dev.dependencies]
-pytest = "^7"
-pytest-asyncio = ">=0.21"
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+    "pytest-asyncio>=1.4.0",
+    "ruff>=0.16.9",
+]
 
 [build-system]
-requires = ["poetry-core"]
-build-backend = "poetry.core.masonry.api"
+requires = ["hatchling>=1.32.4"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/web3_rpc_router"]
+
+[tool.uv]
+exclude-newer = "4 weeks"
+exclude-newer-package = { aiohttp = "2026-10-06T00:00:00Z", certifi = "2026-10-21T00:00:00Z" }
+
+[tool.pytest.ini_options]
+asyncio_default_fixture_loop_scope = "function"
+filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100

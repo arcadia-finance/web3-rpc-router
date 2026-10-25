@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from typing import Dict, List, Optional
 
 import aiohttp
 from aiohttp.resolver import aiodns_default
@@ -15,11 +14,11 @@ from web3_rpc_router.provider import ProviderConfig, ProviderState, RoutingProvi
 logger = logging.getLogger("web3_rpc_router")
 
 # Max simultaneous keep-alive connections per provider session. See
-# `_init_keepalive_sessions` for why we override web3 7's default connector.
+# `_init_keepalive_sessions` for why we override web3's default connector.
 _DEFAULT_CONNECTION_LIMIT = 100
 
 
-def _build_resolver(use_async_dns: bool) -> "aiohttp.abc.AbstractResolver":
+def _build_resolver(use_async_dns: bool) -> aiohttp.abc.AbstractResolver:
     """Return the DNS resolver for every pooled session.
 
     Defaults to ``ThreadedResolver`` because it is the only one whose behaviour under
@@ -52,13 +51,8 @@ def _evict_cached_session(w3: AsyncWeb3) -> None:
     ``stop()``, web3 discards the session passed in and caches one of its own built with
     ``force_close=True`` instead. That silently undoes both the connection pooling this
     router seeds and the resolver it chose, so clear the entry first.
-
-    Best effort: the cache is web3-internal and its shape is not part of web3's API.
     """
-    try:
-        w3.provider._request_session_manager.session_cache.clear()
-    except Exception:  # pragma: no cover - depends on web3 internals
-        logger.debug("Could not clear web3's session cache; keep-alive may not apply")
+    w3.provider._request_session_manager.session_cache.clear()
 
 
 class RPCRouter:
@@ -92,10 +86,10 @@ class RPCRouter:
         self._retry_interval = retry_interval
         self._connection_limit = connection_limit
         self._use_async_dns = use_async_dns
-        self._providers: Dict[int, List[ProviderState]] = {}
-        self._sessions: List[aiohttp.ClientSession] = []
-        self._resolver: Optional["aiohttp.abc.AbstractResolver"] = None
-        self._health_checker: Optional[HealthChecker] = None
+        self._providers: dict[int, list[ProviderState]] = {}
+        self._sessions: list[aiohttp.ClientSession] = []
+        self._resolver: aiohttp.abc.AbstractResolver | None = None
+        self._health_checker: HealthChecker | None = None
         self._started = False
 
     def add_provider(self, chain_id: int, config: ProviderConfig) -> None:
@@ -125,7 +119,7 @@ class RPCRouter:
     async def _init_keepalive_sessions(self) -> None:
         """Give each provider's async client a keep-alive (connection-pooling) session.
 
-        web3 7's ``AsyncHTTPProvider`` lazily caches an ``aiohttp`` session built with
+        web3's ``AsyncHTTPProvider`` lazily caches an ``aiohttp`` session built with
         ``TCPConnector(force_close=True)``, which disables HTTP keep-alive — every RPC
         call then pays a fresh TCP+TLS handshake. Under the concurrency this router is
         built for (many simultaneous ``eth_call``/multicall requests sharing one
@@ -176,7 +170,7 @@ class RPCRouter:
         self._started = False
 
     @property
-    def chain_ids(self) -> List[int]:
+    def chain_ids(self) -> list[int]:
         """Return all configured chain IDs."""
         return list(self._providers.keys())
 
@@ -294,7 +288,7 @@ class RPCRouter:
         """
         return self._select_provider(chain_id).async_w3
 
-    def get_provider_status(self, chain_id: int) -> List[dict]:
+    def get_provider_status(self, chain_id: int) -> list[dict]:
         """Return status of all providers for a chain (for monitoring)."""
         return [
             {
@@ -307,13 +301,13 @@ class RPCRouter:
             for p in self._providers.get(chain_id, [])
         ]
 
-    def status(self) -> Dict[int, List[dict]]:
+    def status(self) -> dict[int, list[dict]]:
         """Return a summary of all providers across all chains.
 
         Returns a dict keyed by chain_id, each containing a list of provider
         status dicts with a ``behind`` field showing blocks behind the chain head.
         """
-        result: Dict[int, List[dict]] = {}
+        result: dict[int, list[dict]] = {}
         now = time.time()
         for chain_id, providers in self._providers.items():
             max_block = max((p.last_block for p in providers), default=0)

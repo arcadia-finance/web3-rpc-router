@@ -84,7 +84,7 @@ class RoutingProvider(JSONBaseProvider):
     RPC-level ``{"error": ...}`` response is returned as-is (deterministic, not retried).
     """
 
-    def __init__(self, router: "RPCRouter", chain_id: int) -> None:
+    def __init__(self, router: RPCRouter, chain_id: int) -> None:
         super().__init__()
         self._router = router
         self._chain_id = chain_id
@@ -95,10 +95,10 @@ class RoutingProvider(JSONBaseProvider):
 
     def is_connected(self, show_traceback: bool = False) -> bool:
         try:
-            return self._router._select_provider(
-                self._chain_id
-            ).w3.provider.is_connected(show_traceback)
-        except Exception:
+            return self._router._select_provider(self._chain_id).w3.provider.is_connected(
+                show_traceback
+            )
+        except ValueError:
             return False
 
     def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
