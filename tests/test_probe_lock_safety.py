@@ -50,7 +50,7 @@ async def _start_rpc_server():
 async def _stop_router(router):
     try:
         await asyncio.wait_for(router.stop(), timeout=3)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         pass  # a wedged run must still let the test report its failure
 
 
@@ -67,9 +67,7 @@ async def test_probe_cycle_survives_a_contended_web3_lock():
     for i in range(8):
         router.add_provider(
             1,
-            ProviderConfig(
-                name=f"p{i}", url=f"http://127.0.0.1:{port}/{i}", priority=i + 1
-            ),
+            ProviderConfig(name=f"p{i}", url=f"http://127.0.0.1:{port}/{i}", priority=i + 1),
         )
     try:
         await router.start()
@@ -83,21 +81,19 @@ async def test_probe_cycle_survives_a_contended_web3_lock():
                 HTTPSessionManager._lock.release()
 
         providers = router._providers[1]
-        assert all(
-            p.consecutive_failures == 0 for p in providers
-        ), "probes must not block on web3's session-manager lock"
+        assert all(p.consecutive_failures == 0 for p in providers), (
+            "probes must not block on web3's session-manager lock"
+        )
         assert all(p.healthy for p in providers)
         assert all(p.last_block == 1_000_000 for p in providers)
         assert still_ours, "a probe released a lock it did not own"
 
         await asyncio.sleep(0.3)  # room for any abandoned acquire to land
-        assert (
-            not HTTPSessionManager._lock.locked()
-        ), "a cancelled probe left web3's process-wide lock held"
-
-        block = await asyncio.wait_for(
-            router.get_async_web3(1).eth.block_number, timeout=5
+        assert not HTTPSessionManager._lock.locked(), (
+            "a cancelled probe left web3's process-wide lock held"
         )
+
+        block = await asyncio.wait_for(router.get_async_web3(1).eth.block_number, timeout=5)
         assert block == 1_000_000
     finally:
         await _stop_router(router)
@@ -132,23 +128,19 @@ async def test_probe_cycle_never_acquires_the_web3_lock():
     for i in range(4):
         router.add_provider(
             1,
-            ProviderConfig(
-                name=f"p{i}", url=f"http://127.0.0.1:{port}/{i}", priority=i + 1
-            ),
+            ProviderConfig(name=f"p{i}", url=f"http://127.0.0.1:{port}/{i}", priority=i + 1),
         )
     try:
         await router.start()  # seeding the sessions may legitimately take the lock
         baseline = counting.acquires
         await router._health_checker.check_all()
         await router._health_checker.check_all()
-        assert (
-            counting.acquires == baseline
-        ), "the probe path must stay off web3's session-manager lock"
+        assert counting.acquires == baseline, (
+            "the probe path must stay off web3's session-manager lock"
+        )
 
         # The lock still works for real traffic, which is allowed to take it.
-        block = await asyncio.wait_for(
-            router.get_async_web3(1).eth.block_number, timeout=5
-        )
+        block = await asyncio.wait_for(router.get_async_web3(1).eth.block_number, timeout=5)
         assert block == 1_000_000
         assert counting.acquires > 0
     finally:

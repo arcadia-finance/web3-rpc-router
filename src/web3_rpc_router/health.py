@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import time
-from typing import Dict, List, Optional
 
 from web3_rpc_router.provider import ProviderState
 
@@ -31,7 +30,7 @@ class HealthChecker:
 
     def __init__(
         self,
-        providers: Dict[int, List[ProviderState]],
+        providers: dict[int, list[ProviderState]],
         interval: float,
         max_block_lag: int,
         timeout: float,
@@ -42,13 +41,13 @@ class HealthChecker:
         self._retry_interval = retry_interval
         self._max_block_lag = max_block_lag
         self._timeout = timeout
-        self._task: Optional[asyncio.Task] = None
+        self._task: asyncio.Task | None = None
 
     def start(self) -> None:
         """Start the background health check loop."""
         self._task = asyncio.create_task(self._loop())
 
-    def stop(self) -> Optional[asyncio.Task]:
+    def stop(self) -> asyncio.Task | None:
         """Cancel the background loop and return its task so callers can await it.
 
         The task is returned rather than dropped because a cycle may be mid-probe:
@@ -60,7 +59,7 @@ class HealthChecker:
             task.cancel()
         return task
 
-    def _due_providers(self, now: float) -> List[tuple]:
+    def _due_providers(self, now: float) -> list[tuple]:
         """``(chain_id, provider)`` pairs to probe on this cycle.
 
         A provider inside an open backoff window is skipped, unless its chain has no
@@ -69,12 +68,10 @@ class HealthChecker:
         and waiting out a capped window there would leave selection pinned even after
         another provider started answering.
         """
-        due: List[tuple] = []
+        due: list[tuple] = []
         for chain_id, providers in self._providers.items():
             chain_is_dark = not any(p.healthy for p in providers)
-            due.extend(
-                (chain_id, p) for p in providers if chain_is_dark or p.next_check <= now
-            )
+            due.extend((chain_id, p) for p in providers if chain_is_dark or p.next_check <= now)
         return due
 
     def _has_unhealthy(self) -> bool:
@@ -157,7 +154,7 @@ class HealthChecker:
             )
 
         # Group results back by chain
-        chain_results: Dict[int, List[tuple]] = {}
+        chain_results: dict[int, list[tuple]] = {}
         for (chain_id, p), result in zip(all_providers, results):
             if isinstance(result, _LoopStalled):
                 continue
@@ -267,7 +264,7 @@ class HealthChecker:
         started = time.monotonic()
         try:
             return await self._check_one(p)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             if time.monotonic() - started > self._timeout * _STALL_FACTOR:
                 raise _LoopStalled() from None
             raise
@@ -302,8 +299,7 @@ class HealthChecker:
         session = p.probe_session
         if session is None:
             raise RuntimeError(
-                f"provider {p.config.name} has no probe session; "
-                "RPCRouter.start() assigns it"
+                f"provider {p.config.name} has no probe session; RPCRouter.start() assigns it"
             )
         payload = {"jsonrpc": "2.0", "method": "eth_blockNumber", "params": [], "id": 1}
         async with session.post(p.config.url, json=payload) as resp:

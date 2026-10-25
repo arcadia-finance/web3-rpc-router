@@ -3,7 +3,7 @@ import time
 import aiohttp
 import pytest
 
-from web3_rpc_router import RPCRouter, ProviderConfig
+from web3_rpc_router import ProviderConfig, RPCRouter
 from web3_rpc_router.provider import ProviderState
 
 
@@ -229,9 +229,7 @@ class TestGetProviderStatus:
     def test_returns_status_dicts(self):
         router = RPCRouter()
         router.add_provider(1, ProviderConfig(name="local", url="http://a", priority=1))
-        router.add_provider(
-            1, ProviderConfig(name="alchemy", url="http://b", priority=2)
-        )
+        router.add_provider(1, ProviderConfig(name="alchemy", url="http://b", priority=2))
 
         status = router.get_provider_status(1)
         assert len(status) == 2
@@ -375,12 +373,8 @@ class TestDegradedModeUsesLastKnownGood:
         """The highest-priority provider is often the one whose failure got us here, so
         priority order is the wrong fallback when nothing is healthy."""
         router = RPCRouter()
-        router.add_provider(
-            1, ProviderConfig(name="primary", url="http://a", priority=1)
-        )
-        router.add_provider(
-            1, ProviderConfig(name="backup", url="http://b", priority=2)
-        )
+        router.add_provider(1, ProviderConfig(name="primary", url="http://a", priority=1))
+        router.add_provider(1, ProviderConfig(name="backup", url="http://b", priority=2))
         primary, backup = router._providers[1]
         primary.healthy = backup.healthy = False
         primary.last_block = 100  # went dark a while ago
@@ -390,13 +384,29 @@ class TestDegradedModeUsesLastKnownGood:
 
     def test_ties_and_cold_start_fall_back_to_priority(self):
         router = RPCRouter()
-        router.add_provider(
-            1, ProviderConfig(name="primary", url="http://a", priority=1)
-        )
-        router.add_provider(
-            1, ProviderConfig(name="backup", url="http://b", priority=2)
-        )
+        router.add_provider(1, ProviderConfig(name="primary", url="http://a", priority=1))
+        router.add_provider(1, ProviderConfig(name="backup", url="http://b", priority=2))
         for p in router._providers[1]:
             p.healthy = False  # nothing has ever answered, last_block == 0
 
         assert router._select_provider(1).config.name == "primary"
+
+
+class TestKeepaliveSessionReuse:
+    @pytest.mark.asyncio
+    async def test_restart_keeps_the_pooled_session_in_web3s_cache(self):
+        router = RPCRouter(health_check_timeout=0.1)
+        router.add_provider(1, ProviderConfig(name="a", url="http://127.0.0.1:1", priority=1))
+        state = router._providers[1][0]
+        try:
+            for _ in range(2):
+                await router.start()
+                cached = [
+                    s
+                    for _, s in state.async_w3.provider._request_session_manager.session_cache.items()
+                ]
+                assert cached == [state.probe_session]
+                assert not state.probe_session.connector.force_close
+                await router.stop()
+        finally:
+            await router.stop()

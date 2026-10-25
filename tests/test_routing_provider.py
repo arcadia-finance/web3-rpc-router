@@ -2,8 +2,9 @@ from unittest.mock import MagicMock
 
 import pytest
 import requests
+from web3.exceptions import ProviderConnectionError
 
-from web3_rpc_router import ProviderConfig, RPCRouter, RoutingProvider
+from web3_rpc_router import ProviderConfig, RoutingProvider, RPCRouter
 
 
 def _router_two_providers():
@@ -57,12 +58,8 @@ def test_rpc_error_returned_without_retry():
 def test_all_providers_exhausted_reraises():
     router = _router_two_providers()
     a, b = router._providers[1]
-    a.w3.provider.make_request = MagicMock(
-        side_effect=requests.exceptions.ConnectionError("A")
-    )
-    b.w3.provider.make_request = MagicMock(
-        side_effect=requests.exceptions.ConnectionError("B")
-    )
+    a.w3.provider.make_request = MagicMock(side_effect=requests.exceptions.ConnectionError("A"))
+    b.w3.provider.make_request = MagicMock(side_effect=requests.exceptions.ConnectionError("B"))
 
     with pytest.raises(requests.exceptions.ConnectionError):
         RoutingProvider(router, 1).make_request("eth_blockNumber", [])
@@ -90,9 +87,7 @@ def test_eth_namespace_flows_through_routing_provider():
     )
 
     w3 = Web3(RoutingProvider(router, 1))
-    assert (
-        w3.eth.block_number == 16
-    )  # 0x10, decoded by web3 through the routing provider
+    assert w3.eth.block_number == 16  # 0x10, decoded by web3 through the routing provider
 
 
 def test_endpoint_uri_tracks_best_provider():
@@ -101,3 +96,22 @@ def test_endpoint_uri_tracks_best_provider():
     assert rp.endpoint_uri == "http://a"  # priority 1
     router.report_failure(1)  # demote a
     assert rp.endpoint_uri == "http://b"  # now b
+
+
+def _router_unreachable():
+    router = RPCRouter()
+    router.add_provider(1, ProviderConfig(name="a", url="http://127.0.0.1:1", priority=1))
+    return router
+
+
+def test_is_connected_false_when_provider_unreachable():
+    assert RoutingProvider(_router_unreachable(), 1).is_connected() is False
+
+
+def test_is_connected_raises_when_traceback_requested():
+    with pytest.raises(ProviderConnectionError):
+        RoutingProvider(_router_unreachable(), 1).is_connected(show_traceback=True)
+
+
+def test_is_connected_false_without_providers():
+    assert RoutingProvider(RPCRouter(), 1).is_connected() is False

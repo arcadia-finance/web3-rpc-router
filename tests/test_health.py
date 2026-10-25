@@ -4,8 +4,8 @@ import time
 
 import pytest
 
-from web3_rpc_router.provider import ProviderConfig, ProviderState
 from web3_rpc_router.health import HealthChecker
+from web3_rpc_router.provider import ProviderConfig, ProviderState
 
 
 class _FakeResponse:
@@ -53,9 +53,7 @@ class _FakeProbeSession:
 
 def _make_provider(name, priority=1, block_number=100, delay=0.0):
     """Create a ProviderState whose probe returns `block_number`."""
-    state = ProviderState(
-        config=ProviderConfig(name=name, url="http://fake", priority=priority)
-    )
+    state = ProviderState(config=ProviderConfig(name=name, url="http://fake", priority=priority))
     state.probe_session = _FakeProbeSession(block_number=block_number, delay=delay)
     return state
 
@@ -266,9 +264,7 @@ class TestCooldownReset:
 
     @pytest.mark.asyncio
     async def test_successful_check_clears_cooldown(self, monkeypatch):
-        p1 = ProviderState(
-            config=ProviderConfig(name="a", url="http://fake", priority=1)
-        )
+        p1 = ProviderState(config=ProviderConfig(name="a", url="http://fake", priority=1))
         p1.cooldown_until = time.time() + 120  # demoted
         providers = {1: [p1]}
 
@@ -287,9 +283,7 @@ class TestCooldownReset:
 
     @pytest.mark.asyncio
     async def test_failed_check_preserves_cooldown(self, monkeypatch):
-        p1 = ProviderState(
-            config=ProviderConfig(name="a", url="http://fake", priority=1)
-        )
+        p1 = ProviderState(config=ProviderConfig(name="a", url="http://fake", priority=1))
         target = time.time() + 120
         p1.cooldown_until = target
         providers = {1: [p1]}
@@ -379,9 +373,7 @@ class TestProbeBackoff:
     """
 
     def test_backoff_delay_progression(self):
-        checker = HealthChecker(
-            {}, interval=60, max_block_lag=1, timeout=5, retry_interval=30
-        )
+        checker = HealthChecker({}, interval=60, max_block_lag=1, timeout=5, retry_interval=30)
         assert checker._backoff_delay(0) == 0.0
         assert checker._backoff_delay(2) == 0.0  # still within its allowance
         assert checker._backoff_delay(3) == 30.0
@@ -650,9 +642,7 @@ class TestOneMissedProbeIsNotDeath:
         _set_block(peer, 140)
         await checker.check_all()
 
-        assert (
-            good.healthy is True
-        ), "one missed probe must not mark a proven provider dead"
+        assert good.healthy is True, "one missed probe must not mark a proven provider dead"
         assert good.consecutive_failures == 1
 
     @pytest.mark.asyncio
@@ -697,9 +687,7 @@ class TestOneMissedProbeIsNotDeath:
         _set_block(b, 100_000)  # peer races far ahead while a is silent
         await checker.check_all()
 
-        assert (
-            a.healthy is True
-        ), "a stale block must not be compared against a fresh peer"
+        assert a.healthy is True, "a stale block must not be compared against a fresh peer"
 
 
 class TestMeasurementGap:
@@ -718,8 +706,8 @@ class TestMeasurementGap:
         await checker.check_all()
         assert a.healthy and b.healthy
 
-        _fail_provider(a, asyncio.TimeoutError())
-        _fail_provider(b, asyncio.TimeoutError())
+        _fail_provider(a, TimeoutError())
+        _fail_provider(b, TimeoutError())
         for _ in range(5):  # well past the 3-strike threshold
             await checker.check_all()
 
@@ -735,8 +723,8 @@ class TestMeasurementGap:
         checker = HealthChecker(providers, interval=60, max_block_lag=5, timeout=5)
         await checker.check_all()
 
-        _fail_provider(a, asyncio.TimeoutError())
-        _fail_provider(b, asyncio.TimeoutError())
+        _fail_provider(a, TimeoutError())
+        _fail_provider(b, TimeoutError())
         for _ in range(4):
             await checker.check_all()
 
@@ -785,7 +773,7 @@ class TestMeasurementGap:
 
         target = time.time() + 120
         p1.cooldown_until = target
-        _fail_provider(p1, asyncio.TimeoutError())
+        _fail_provider(p1, TimeoutError())
         await checker.check_all()
 
         assert p1.cooldown_until == target
@@ -820,9 +808,7 @@ class TestStalledLoop:
         # Probed after `hanging`: it stalls the loop for 4x the timeout, so the
         # hanging probe's timer can only fire long after its deadline.
         blocker.probe_session = _LoopBlockingSession(block_number=101, block_seconds=0.2)
-        checker = HealthChecker(
-            {1: [hanging, blocker]}, interval=60, max_block_lag=5, timeout=0.05
-        )
+        checker = HealthChecker({1: [hanging, blocker]}, interval=60, max_block_lag=5, timeout=0.05)
         last_check = hanging.last_check
         await checker.check_all()
 
