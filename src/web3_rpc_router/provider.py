@@ -15,6 +15,17 @@ if TYPE_CHECKING:
 # RPC-level {"error": ...} response, which is deterministic and returned as-is).
 _FAILOVER_EXC = (OSError, TimeoutError, requests.exceptions.RequestException)
 
+# web3's validation middleware reads eth_chainId before and after every eth_call, eth_estimateGas,
+# eth_createAccessList and eth_sendTransaction, so without a cache one contract read costs three
+# round trips. An endpoint's chain id never changes: each provider caches eth_chainId, and only
+# that method. A threshold of None stores it without the extra eth_chainId request web3 makes to
+# pick a block-validation threshold, which only methods other than eth_chainId use.
+_CHAIN_ID_CACHE: dict[str, Any] = {
+    "cache_allowed_requests": True,
+    "cacheable_requests": {RPCEndpoint("eth_chainId")},
+    "request_cache_validation_threshold": None,
+}
+
 
 @dataclass
 class ProviderConfig:
@@ -65,12 +76,14 @@ class ProviderState:
             Web3.HTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
+                **_CHAIN_ID_CACHE,
             )
         )
         self.async_w3 = AsyncWeb3(
             AsyncWeb3.AsyncHTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
+                **_CHAIN_ID_CACHE,
             )
         )
 
