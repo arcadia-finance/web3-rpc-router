@@ -4,7 +4,7 @@ version = "0.5.1"
 description = "Multi-provider RPC routing for web3.py with health checking"
 requires-python = ">=3.14"
 dependencies = [
-    "aiohttp>=3.14.3",
+    "aiohttp>=3.14.5",
     "requests>=2.34.2",
     "web3>=8.0.0,<9",
 ]
@@ -13,7 +13,7 @@ dependencies = [
 dev = [
     "pytest>=9.1.1",
     "pytest-asyncio>=1.4.0",
-    "ruff>=0.16.9",
+    "ruff>=0.17.1",
 ]
 
 [build-system]
@@ -25,7 +25,7 @@ packages = ["src/web3_rpc_router"]
 
 [tool.uv]
 exclude-newer = "4 weeks"
-exclude-newer-package = { aiohttp = "1 week", certifi = "1 day" }
+exclude-newer-package = { aiohttp = "5 days", bitarray = "5 days", certifi = "1 day", charset-normalizer = "5 days", cytoolz = "5 days", idna = "5 days", iniconfig = "5 days", multidict = "5 days", pluggy = "5 days", propcache = "5 days", pycryptodome = "5 days", pydantic = "5 days", pydantic-core = "5 days", pyunormalize = "5 days", regex = "5 days", ruff = "5 days", toolz = "5 days", websockets = "5 days" }
 
 [tool.pytest.ini_options]
 asyncio_default_fixture_loop_scope = "function"
