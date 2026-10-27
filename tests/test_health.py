@@ -975,3 +975,43 @@ class TestLagInSeconds:
 
         assert fast[1].healthy is True
         assert slow[1].healthy is False
+
+    @pytest.mark.asyncio
+    async def test_one_wrong_block_number_does_not_lift_the_lag_check(self, monkeypatch):
+        """One provider answers a far-future block once. Its rate is near zero, but the median
+        of the four providers keeps the 2s block time, so a provider stuck 30 blocks (60s)
+        behind is still caught once the spike is gone."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        good, other, stuck, wild = (
+            _make_provider("good", 1, 10_000),
+            _make_provider("other", 2, 10_000),
+            _make_provider("stuck", 3, 10_000),
+            _make_provider("wild", 4, 10_000),
+        )
+        checker = HealthChecker(
+            {1: [good, other, stuck, wild]},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            max_lag_seconds=10,
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        for p in (good, other, stuck):
+            _set_block(p, 10_030)
+        _set_block(wild, 10_000_000)
+        await checker.check_all()
+
+        clock.now += 60
+        for p in (good, other, wild):
+            _set_block(p, 10_060)
+        _set_block(stuck, 10_030)
+        await checker.check_all()
+
+        assert good.healthy is True
+        assert other.healthy is True
+        assert stuck.healthy is False

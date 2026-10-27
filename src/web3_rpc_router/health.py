@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import statistics
 import time
 
 from web3_rpc_router.provider import ProviderState
@@ -44,10 +45,10 @@ class HealthChecker:
         self._max_lag_seconds = max_lag_seconds
         self._timeout = timeout
         self._task: asyncio.Task | None = None
-        # Per chain: the best block any provider proved and when, and the seconds per block
-        # measured between two such observations. See ``_allowed_lag``.
-        self._head: dict[int, tuple[int, float]] = {}
-        self._block_time: dict[int, float] = {}
+        # Per provider (by id): its last answered block and when, and the seconds per block
+        # measured between two of its answers. See ``_allowed_lag``.
+        self._last_answer: dict[int, tuple[int, float]] = {}
+        self._seconds_per_block: dict[int, float] = {}
 
     def start(self) -> None:
         """Start the background health check loop."""
@@ -197,6 +198,7 @@ class HealthChecker:
                             p.consecutive_failures,
                         )
                 else:
+                    self._measure_block_time(p, result, now)
                     p.last_block = result
                     p.consecutive_failures = 0
                     p.next_check = 0.0
@@ -213,8 +215,6 @@ class HealthChecker:
             # did not answer are deliberately excluded: comparing their stale last_block
             # against a peer's fresh one would mark a provider dead for missing a single
             # probe, which is a measurement gap rather than evidence about the provider.
-            if max_block:
-                self._track_head(chain_id, max_block, now)
             allowed_lag = self._allowed_lag(chain_id)
             for p, result in provider_results:
                 was_healthy = p.healthy
@@ -249,14 +249,16 @@ class HealthChecker:
                         p.last_block,
                     )
 
-    def _track_head(self, chain_id: int, best_block: int, now: float) -> None:
-        """Record the chain's best block and, once it has advanced, its seconds per block."""
-        previous = self._head.get(chain_id)
-        if previous is not None and best_block <= previous[0]:
-            return  # no progress since the last observation, so nothing to measure
-        if previous is not None and now > previous[1]:
-            self._block_time[chain_id] = (now - previous[1]) / (best_block - previous[0])
-        self._head[chain_id] = (best_block, now)
+    def _measure_block_time(self, p: ProviderState, block: int, now: float) -> None:
+        """Record ``p``'s answer and, if it advanced since its last one, the seconds per block.
+
+        The last answer is always overwritten, so a wrong block number is forgotten at the
+        provider's next answer; a stalled or regressed provider keeps its previous rate.
+        """
+        previous = self._last_answer.get(id(p))
+        self._last_answer[id(p)] = (block, now)
+        if previous is not None and block > previous[0] and now > previous[1]:
+            self._seconds_per_block[id(p)] = (now - previous[1]) / (block - previous[0])
 
     def _allowed_lag(self, chain_id: int) -> int:
         """Blocks a provider may trail this cycle's best block by and still count as in sync.
@@ -265,14 +267,21 @@ class HealthChecker:
         whichever is more. Probes to a chain's providers run concurrently but answer tens to
         hundreds of milliseconds apart, so a fixed block count means a different staleness on
         every chain: 5 blocks is 10s on a 2s chain, 60s on a 12s one, and 0.5s on a 0.1s chain,
-        where the spread between answers alone exceeds it. The seconds allowance applies once
-        the chain's block time has been measured, from the best block's progress between two
-        cycles; until then, and when ``max_lag_seconds`` is 0, only the block count applies.
+        where the spread between answers alone exceeds it.
+
+        The chain's block time is the median of its providers' own rates, each measured between
+        two of that provider's answers. One provider's wrong block number, or a catch-up jump
+        after a stall, skews only its own rate, which the median outvotes. Until a rate has been
+        measured, and when ``max_lag_seconds`` is 0, only the block count applies.
         """
-        block_time = self._block_time.get(chain_id)
-        if not self._max_lag_seconds or not block_time:
+        rates = [
+            self._seconds_per_block[id(p)]
+            for p in self._providers.get(chain_id, [])
+            if id(p) in self._seconds_per_block
+        ]
+        if not self._max_lag_seconds or not rates:
             return self._max_block_lag
-        return max(self._max_block_lag, int(self._max_lag_seconds / block_time))
+        return max(self._max_block_lag, int(self._max_lag_seconds / statistics.median(rates)))
 
     def _backoff_delay(self, failures: int) -> float:
         """Seconds to skip a provider that has failed ``failures`` checks in a row.
