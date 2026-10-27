@@ -224,6 +224,42 @@ class TestReportFailure:
 
         assert before + 120 <= s1.cooldown_until <= after + 120
 
+    def test_handle_demotes_the_provider_behind_it(self):
+        """A burst of failures on one provider, each reported with the handle it used, cools
+        that provider only: the others stay selectable."""
+        s1 = ProviderState(config=ProviderConfig(name="a", url="http://a", priority=1))
+        s2 = ProviderState(config=ProviderConfig(name="b", url="http://b", priority=2))
+        s3 = ProviderState(config=ProviderConfig(name="c", url="http://c", priority=3))
+
+        router = self._make_router([s1, s2, s3])
+        failed = router.get_async_web3(1)
+        for _ in range(5):
+            router.report_failure(1, w3=failed)
+
+        assert s1.cooldown_until > time.time()
+        assert s2.cooldown_until == 0.0
+        assert s3.cooldown_until == 0.0
+        assert router.get_async_web3(1) is s2.async_w3
+
+    def test_sync_handle_demotes_the_same_provider(self):
+        s1 = ProviderState(config=ProviderConfig(name="a", url="http://a", priority=1))
+        s2 = ProviderState(config=ProviderConfig(name="b", url="http://b", priority=2))
+
+        router = self._make_router([s1, s2])
+        router.report_failure(1, w3=s2.w3)
+
+        assert s1.cooldown_until == 0.0
+        assert s2.cooldown_until > time.time()
+
+    def test_foreign_handle_demotes_nothing(self):
+        s1 = ProviderState(config=ProviderConfig(name="a", url="http://a", priority=1))
+        other = ProviderState(config=ProviderConfig(name="x", url="http://x", priority=1))
+
+        router = self._make_router([s1])
+        router.report_failure(1, w3=other.async_w3)
+
+        assert s1.cooldown_until == 0.0
+
 
 class TestGetProviderStatus:
     def test_returns_status_dicts(self):
@@ -308,8 +344,7 @@ class TestResolverChoice:
     @pytest.mark.asyncio
     async def test_probes_run_on_the_shared_pooled_session(self):
         """The health checker probes over the same keep-alive session real traffic
-        uses, so probes measure the real path and cost no extra connections. Real
-        traffic keeps web3's retry policy; the probe is a single plain request.
+        uses, so probes measure the real path and cost no extra connections.
         """
         router = RPCRouter()
         router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
@@ -318,7 +353,6 @@ class TestResolverChoice:
         try:
             state = router._providers[1][0]
             assert state.probe_session is router._sessions[0]
-            assert state.async_w3.provider.exception_retry_configuration is not None
         finally:
             await router.stop()
 

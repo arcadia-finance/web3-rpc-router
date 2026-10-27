@@ -115,3 +115,59 @@ def test_is_connected_raises_when_traceback_requested():
 
 def test_is_connected_false_without_providers():
     assert RoutingProvider(RPCRouter(), 1).is_connected() is False
+
+
+def _http_error(status):
+    response = requests.Response()
+    response.status_code = status
+    return requests.exceptions.HTTPError(f"{status} error", response=response)
+
+
+@pytest.mark.parametrize("status", [400, 413])
+def test_request_fault_raises_without_failover(status):
+    """A 400 or 413 is the request's own fault: every provider would refuse it alike."""
+    router = _router_two_providers()
+    a, b = router._providers[1]
+    a.w3.provider.make_request = MagicMock(side_effect=_http_error(status))
+    b.w3.provider.make_request = MagicMock(
+        return_value={"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+    )
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        RoutingProvider(router, 1).make_request("eth_call", [])
+
+    b.w3.provider.make_request.assert_not_called()
+    assert a.cooldown_until == 0.0
+
+
+@pytest.mark.parametrize("status", [401, 403, 429, 503])
+def test_provider_refusal_fails_over(status):
+    router = _router_two_providers()
+    a, b = router._providers[1]
+    a.w3.provider.make_request = MagicMock(side_effect=_http_error(status))
+    b.w3.provider.make_request = MagicMock(
+        return_value={"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+    )
+
+    assert RoutingProvider(router, 1).make_request("eth_call", [])["result"] == "0x1"
+    assert a.cooldown_until > 0
+    assert b.cooldown_until == 0.0
+
+
+def test_the_failed_provider_is_demoted_even_after_a_concurrent_report():
+    """A concurrent request's report demotes A while this request is still waiting on A. This
+    request's own report must land on A again, not on B, the selection by then."""
+    router = _router_two_providers()
+    a, b = router._providers[1]
+
+    def concurrent_report_then_fail(method, params):
+        router.report_failure(1)  # another request's report, made while A was still selected
+        raise _http_error(429)
+
+    a.w3.provider.make_request = MagicMock(side_effect=concurrent_report_then_fail)
+    b.w3.provider.make_request = MagicMock(
+        return_value={"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+    )
+
+    assert RoutingProvider(router, 1).make_request("eth_call", [])["result"] == "0x1"
+    assert b.cooldown_until == 0.0

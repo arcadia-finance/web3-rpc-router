@@ -228,34 +228,46 @@ class RPCRouter:
         )
         return best
 
-    def report_failure(self, chain_id: int, cooldown: float = 60.0) -> None:
-        """Demote the currently-selected provider for ``chain_id``.
+    def report_failure(
+        self,
+        chain_id: int,
+        cooldown: float = 60.0,
+        w3: Web3 | AsyncWeb3 | None = None,
+    ) -> None:
+        """Demote the provider a real request (not the background health check) failed on.
 
-        Called by consumers when a real request (not the background health
-        check) fails on whichever provider was handed out most recently —
-        timeouts, connection errors, etc. The provider is skipped by
-        ``_select_provider`` for ``cooldown`` seconds, giving the retry loop a
-        chance to rotate to the next-priority provider. The cooldown is cleared
+        The provider is skipped by ``_select_provider`` for ``cooldown`` seconds, giving the
+        retry loop a chance to rotate to the next-priority provider. The cooldown is cleared
         automatically by the next successful background health check.
 
+        ``w3`` is the handle the failed request used, as returned by ``get_web3`` or
+        ``get_async_web3``; the provider behind it is demoted, and a ``w3`` this router did not
+        hand out demotes nothing. Without ``w3`` the current selection is demoted, which is the
+        provider that failed only if no other report landed since the request picked it. Under
+        concurrent failures on one provider each later report would demote the next provider in
+        line, until every provider cools and selection falls back to the one failing.
+
         Safe to call when no providers are configured for the chain (no-op).
-        The selection used to identify "currently-selected" is the same logic
-        ``get_web3`` / ``get_async_web3`` use, so the demoted provider is the
-        one most likely responsible for the failure.
         """
-        if not self._providers.get(chain_id):
+        providers = self._providers.get(chain_id)
+        if not providers:
             return
-        try:
+        if w3 is None:
             state = self._select_provider(chain_id)
-        except ValueError:
-            return
-        state.cooldown_until = time.time() + cooldown
-        logger.warning(
-            "Provider %s (chain %d) demoted for %.0fs after request-level failure",
-            state.config.name,
-            chain_id,
-            cooldown,
-        )
+        else:
+            state = next((p for p in providers if w3 is p.w3 or w3 is p.async_w3), None)
+            if state is None:
+                return
+        now = time.time()
+        already_cooling = state.cooldown_until > now
+        state.cooldown_until = now + cooldown
+        if not already_cooling:
+            logger.warning(
+                "Provider %s (chain %d) demoted for %.0fs after request-level failure",
+                state.config.name,
+                chain_id,
+                cooldown,
+            )
 
     def get_web3(self, chain_id: int) -> Web3:
         """Return the best sync Web3 instance for the given chain.
