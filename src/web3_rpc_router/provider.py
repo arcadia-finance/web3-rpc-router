@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -20,6 +21,15 @@ _FAILOVER_EXC = (OSError, TimeoutError, requests.exceptions.RequestException)
 # demote each provider in turn; the error is raised as-is. Any other status is the provider
 # refusing or failing (a bad, revoked or exhausted key, a rate limit, a server error).
 _REQUEST_FAULT_STATUSES = (400, 413)
+
+
+# RoutingProvider's attempts at one request: every provider once, and never fewer than this. With
+# web3's own retry off, a chain served by one provider would otherwise give a transient failure
+# (a dropped connection, a brief 5xx or 429) no second chance at all.
+_MIN_ATTEMPTS = 2
+# Pause before an attempt that returns to the provider which just failed: the chain's only one, or
+# every other provider is unhealthy or cooling down. An attempt on another provider starts at once.
+_SAME_PROVIDER_RETRY_DELAY = 0.5
 
 
 def _is_request_fault(exc: Exception) -> bool:
@@ -155,18 +165,22 @@ class RoutingProvider(JSONBaseProvider):
             return False
 
     def make_request(self, method: RPCEndpoint, params: Any) -> RPCResponse:
-        attempts = len(self._router._providers.get(self._chain_id, [])) or 1
+        attempts = max(_MIN_ATTEMPTS, len(self._router._providers.get(self._chain_id, [])))
         last_exc: Exception | None = None
+        failed: ProviderState | None = None
         for _ in range(attempts):
             state = self._router._select_provider(
                 self._chain_id
             )  # raises ValueError if no providers
+            if state is failed:
+                time.sleep(_SAME_PROVIDER_RETRY_DELAY)
             try:
                 return state.w3.provider.make_request(method, params)
             except _FAILOVER_EXC as exc:
                 if _is_request_fault(exc):
                     raise
                 last_exc = exc
+                failed = state
                 self._router.report_failure(self._chain_id, w3=state.w3)
         assert last_exc is not None
         raise last_exc
