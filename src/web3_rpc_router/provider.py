@@ -37,6 +37,15 @@ class ProviderConfig:
     request_timeout: int = 15
 
 
+# Both providers are built with ``exception_retry_configuration=None``: one call is one HTTP
+# request. web3's default resends a failed read to the same provider up to five times, with about
+# 1.9s of backoff, on any HTTP or connection error, so a rate limit, a rejected key or a server
+# error reached RoutingProvider or a consumer's report_failure only after that delay, and a
+# provider failing slowly enough overran the consumer's own timeout and was never reported.
+# Where a failed request goes next is the router's decision: RoutingProvider sends it to the next
+# provider, and get_web3 / get_async_web3 consumers retry after report_failure.
+
+
 @dataclass
 class ProviderState:
     """Runtime state for a provider (internal)."""
@@ -53,8 +62,7 @@ class ProviderState:
     # thread, and a probe cancelled by its deadline while that acquire is in
     # flight would abandon the acquire and leave the lock held forever, wedging
     # all real traffic in the process. A plain aiohttp request has no such
-    # cancellation hazard, and it is also one HTTP request instead of the five
-    # web3's retry policy could spend against a refusing endpoint.
+    # cancellation hazard.
     probe_session: Any = field(default=None, repr=False)
     healthy: bool = True
     last_block: int = 0
@@ -76,6 +84,7 @@ class ProviderState:
             Web3.HTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
+                exception_retry_configuration=None,
                 **_CHAIN_ID_CACHE,
             )
         )
@@ -83,6 +92,7 @@ class ProviderState:
             AsyncWeb3.AsyncHTTPProvider(
                 self.config.url,
                 request_kwargs={"timeout": timeout},
+                exception_retry_configuration=None,
                 **_CHAIN_ID_CACHE,
             )
         )

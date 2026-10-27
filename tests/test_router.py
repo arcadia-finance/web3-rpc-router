@@ -308,8 +308,7 @@ class TestResolverChoice:
     @pytest.mark.asyncio
     async def test_probes_run_on_the_shared_pooled_session(self):
         """The health checker probes over the same keep-alive session real traffic
-        uses, so probes measure the real path and cost no extra connections. Real
-        traffic keeps web3's retry policy; the probe is a single plain request.
+        uses, so probes measure the real path and cost no extra connections.
         """
         router = RPCRouter()
         router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
@@ -318,7 +317,6 @@ class TestResolverChoice:
         try:
             state = router._providers[1][0]
             assert state.probe_session is router._sessions[0]
-            assert state.async_w3.provider.exception_retry_configuration is not None
         finally:
             await router.stop()
 
