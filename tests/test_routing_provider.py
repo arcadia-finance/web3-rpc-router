@@ -171,3 +171,70 @@ def test_the_failed_provider_is_demoted_even_after_a_concurrent_report():
 
     assert RoutingProvider(router, 1).make_request("eth_call", [])["result"] == "0x1"
     assert b.cooldown_until == 0.0
+
+
+def _router_one_provider():
+    router = RPCRouter()
+    router.add_provider(1, ProviderConfig(name="a", url="http://a", priority=1))
+    return router
+
+
+@pytest.fixture
+def sleeps(monkeypatch):
+    from web3_rpc_router import provider
+
+    calls = []
+    monkeypatch.setattr(provider.time, "sleep", calls.append)
+    return calls
+
+
+def test_the_only_provider_gets_a_second_attempt(sleeps):
+    """One provider and nothing to fail over to: a transient failure is retried once on it,
+    after a short pause, instead of reaching the caller."""
+    from web3_rpc_router import provider
+
+    router = _router_one_provider()
+    (a,) = router._providers[1]
+    a.w3.provider.make_request = MagicMock(
+        side_effect=[
+            requests.exceptions.ConnectionError("dropped"),
+            {"jsonrpc": "2.0", "id": 1, "result": "0x1"},
+        ]
+    )
+
+    assert RoutingProvider(router, 1).make_request("eth_call", [])["result"] == "0x1"
+    assert a.w3.provider.make_request.call_count == 2
+    assert sleeps == [provider._SAME_PROVIDER_RETRY_DELAY]
+
+
+def test_the_only_provider_failing_twice_raises(sleeps):
+    router = _router_one_provider()
+    (a,) = router._providers[1]
+    a.w3.provider.make_request = MagicMock(side_effect=_http_error(503))
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        RoutingProvider(router, 1).make_request("eth_call", [])
+    assert a.w3.provider.make_request.call_count == 2
+
+
+def test_a_request_fault_on_the_only_provider_is_not_retried(sleeps):
+    router = _router_one_provider()
+    (a,) = router._providers[1]
+    a.w3.provider.make_request = MagicMock(side_effect=_http_error(400))
+
+    with pytest.raises(requests.exceptions.HTTPError):
+        RoutingProvider(router, 1).make_request("eth_call", [])
+    assert a.w3.provider.make_request.call_count == 1
+    assert sleeps == []
+
+
+def test_failing_over_to_another_provider_does_not_pause(sleeps):
+    router = _router_two_providers()
+    a, b = router._providers[1]
+    a.w3.provider.make_request = MagicMock(side_effect=_http_error(429))
+    b.w3.provider.make_request = MagicMock(
+        return_value={"jsonrpc": "2.0", "id": 1, "result": "0x1"}
+    )
+
+    assert RoutingProvider(router, 1).make_request("eth_call", [])["result"] == "0x1"
+    assert sleeps == []
