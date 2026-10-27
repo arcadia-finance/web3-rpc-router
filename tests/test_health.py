@@ -862,3 +862,116 @@ class TestProbeResponseParsing:
         assert broken.healthy is False
         assert broken.consecutive_failures == 1
         assert broken.last_block == 0
+
+
+class _Clock:
+    """Stands in for the ``time`` module in ``web3_rpc_router.health``: wall time is set by the
+    test, monotonic time stays real so probe stall detection is unaffected."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+    @staticmethod
+    def monotonic() -> float:
+        return time.monotonic()
+
+
+class TestLagInSeconds:
+    """A provider is in sync within max_block_lag blocks or max_lag_seconds of the best block,
+    whichever allows more, once the chain's block time has been measured between two cycles."""
+
+    async def _two_cycles(self, monkeypatch, *, blocks_per_minute, behind, max_lag_seconds):
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        head = _make_provider("head", block_number=10_000)
+        other = _make_provider("other", priority=2, block_number=10_000)
+        checker = HealthChecker(
+            {1: [head, other]},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            max_lag_seconds=max_lag_seconds,
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(head, 10_000 + blocks_per_minute)
+        _set_block(other, 10_000 + blocks_per_minute - behind)
+        await checker.check_all()
+        return head, other
+
+    @pytest.mark.asyncio
+    async def test_fast_chain_trails_by_seconds_not_blocks(self, monkeypatch):
+        """0.1s blocks: 50 blocks behind is 5s, inside a 10s allowance."""
+        head, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=50, max_lag_seconds=10
+        )
+        assert head.healthy is True
+        assert other.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_fast_chain_past_the_allowance_is_unhealthy(self, monkeypatch):
+        """0.1s blocks: 150 blocks behind is 15s, past a 10s allowance."""
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=150, max_lag_seconds=10
+        )
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_without_a_seconds_allowance_lag_is_in_blocks(self, monkeypatch):
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=50, max_lag_seconds=0
+        )
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_slow_chain_keeps_the_block_allowance(self, monkeypatch):
+        """12s blocks: 4 blocks behind is 48s, past 10s, but within max_block_lag."""
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=5, behind=4, max_lag_seconds=10
+        )
+        assert other.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_first_cycle_judges_in_blocks(self, monkeypatch):
+        """No block time is known before the head has advanced once."""
+        from web3_rpc_router import health
+
+        monkeypatch.setattr(health, "time", _Clock(1_000.0))
+        head = _make_provider("head", block_number=10_050)
+        other = _make_provider("other", priority=2, block_number=10_000)
+        checker = HealthChecker(
+            {1: [head, other]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_block_time_is_kept_per_chain(self, monkeypatch):
+        """A fast chain's block time does not loosen a slow chain's allowance."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        fast = [_make_provider("f1", block_number=10_000), _make_provider("f2", 2, 10_000)]
+        slow = [_make_provider("s1", block_number=500), _make_provider("s2", 2, 500)]
+        checker = HealthChecker(
+            {1: fast, 2: slow}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(fast[0], 10_600)
+        _set_block(fast[1], 10_550)  # 5s behind on a 0.1s chain
+        _set_block(slow[0], 505)
+        _set_block(slow[1], 499)  # 6 blocks behind on a 12s chain
+        await checker.check_all()
+
+        assert fast[1].healthy is True
+        assert slow[1].healthy is False

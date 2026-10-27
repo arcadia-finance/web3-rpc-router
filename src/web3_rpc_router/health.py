@@ -35,13 +35,19 @@ class HealthChecker:
         max_block_lag: int,
         timeout: float,
         retry_interval: float = 30.0,
+        max_lag_seconds: float = 0.0,
     ) -> None:
         self._providers = providers
         self._interval = interval
         self._retry_interval = retry_interval
         self._max_block_lag = max_block_lag
+        self._max_lag_seconds = max_lag_seconds
         self._timeout = timeout
         self._task: asyncio.Task | None = None
+        # Per chain: the best block any provider proved and when, and the seconds per block
+        # measured between two such observations. See ``_allowed_lag``.
+        self._head: dict[int, tuple[int, float]] = {}
+        self._block_time: dict[int, float] = {}
 
     def start(self) -> None:
         """Start the background health check loop."""
@@ -207,11 +213,14 @@ class HealthChecker:
             # did not answer are deliberately excluded: comparing their stale last_block
             # against a peer's fresh one would mark a provider dead for missing a single
             # probe, which is a measurement gap rather than evidence about the provider.
+            if max_block:
+                self._track_head(chain_id, max_block, now)
+            allowed_lag = self._allowed_lag(chain_id)
             for p, result in provider_results:
                 was_healthy = p.healthy
                 if isinstance(result, int):
                     # Answered, so judge it on this cycle's evidence.
-                    p.healthy = (max_block - p.last_block) <= self._max_block_lag
+                    p.healthy = (max_block - p.last_block) <= allowed_lag
                 elif p.consecutive_failures >= _UNHEALTHY_AFTER_FAILURES:
                     # Only sustained failure is evidence of death.
                     p.healthy = False
@@ -239,6 +248,31 @@ class HealthChecker:
                         chain_id,
                         p.last_block,
                     )
+
+    def _track_head(self, chain_id: int, best_block: int, now: float) -> None:
+        """Record the chain's best block and, once it has advanced, its seconds per block."""
+        previous = self._head.get(chain_id)
+        if previous is not None and best_block <= previous[0]:
+            return  # no progress since the last observation, so nothing to measure
+        if previous is not None and now > previous[1]:
+            self._block_time[chain_id] = (now - previous[1]) / (best_block - previous[0])
+        self._head[chain_id] = (best_block, now)
+
+    def _allowed_lag(self, chain_id: int) -> int:
+        """Blocks a provider may trail this cycle's best block by and still count as in sync.
+
+        ``max_block_lag`` blocks, or as many blocks as the chain makes in ``max_lag_seconds``,
+        whichever is more. Probes to a chain's providers run concurrently but answer tens to
+        hundreds of milliseconds apart, so a fixed block count means a different staleness on
+        every chain: 5 blocks is 10s on a 2s chain, 60s on a 12s one, and 0.5s on a 0.1s chain,
+        where the spread between answers alone exceeds it. The seconds allowance applies once
+        the chain's block time has been measured, from the best block's progress between two
+        cycles; until then, and when ``max_lag_seconds`` is 0, only the block count applies.
+        """
+        block_time = self._block_time.get(chain_id)
+        if not self._max_lag_seconds or not block_time:
+            return self._max_block_lag
+        return max(self._max_block_lag, int(self._max_lag_seconds / block_time))
 
     def _backoff_delay(self, failures: int) -> float:
         """Seconds to skip a provider that has failed ``failures`` checks in a row.

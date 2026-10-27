@@ -79,9 +79,13 @@ class RPCRouter:
         retry_interval: float = 30.0,
         connection_limit: int = _DEFAULT_CONNECTION_LIMIT,
         use_async_dns: bool = False,
+        max_lag_seconds: float = 0.0,
     ) -> None:
         self._check_interval = check_interval
         self._max_block_lag = max_block_lag
+        # A provider within max_block_lag blocks OR max_lag_seconds of the best block counts
+        # as in sync (see HealthChecker._allowed_lag). 0 judges lag in blocks only.
+        self._max_lag_seconds = max_lag_seconds
         self._health_check_timeout = health_check_timeout
         self._retry_interval = retry_interval
         self._connection_limit = connection_limit
@@ -111,6 +115,7 @@ class RPCRouter:
             max_block_lag=self._max_block_lag,
             timeout=self._health_check_timeout,
             retry_interval=self._retry_interval,
+            max_lag_seconds=self._max_lag_seconds,
         )
         await self._health_checker.check_all()
         self._health_checker.start()
