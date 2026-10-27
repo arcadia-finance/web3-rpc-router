@@ -9,7 +9,7 @@ from aiohttp.resolver import aiodns_default
 from web3 import AsyncWeb3, Web3
 
 from web3_rpc_router.health import HealthChecker
-from web3_rpc_router.provider import ProviderConfig, ProviderState, RoutingProvider
+from web3_rpc_router.provider import ChainConfig, ProviderConfig, ProviderState, RoutingProvider
 
 logger = logging.getLogger("web3_rpc_router")
 
@@ -79,14 +79,20 @@ class RPCRouter:
         retry_interval: float = 30.0,
         connection_limit: int = _DEFAULT_CONNECTION_LIMIT,
         use_async_dns: bool = False,
+        max_lag_seconds: float = 0.0,
     ) -> None:
         self._check_interval = check_interval
         self._max_block_lag = max_block_lag
+        # A provider within max_block_lag blocks OR max_lag_seconds of the best block counts
+        # as in sync (see HealthChecker._allowed_lag). 0 judges lag in blocks only. Both can be
+        # set per chain with configure_chain.
+        self._max_lag_seconds = max_lag_seconds
         self._health_check_timeout = health_check_timeout
         self._retry_interval = retry_interval
         self._connection_limit = connection_limit
         self._use_async_dns = use_async_dns
         self._providers: dict[int, list[ProviderState]] = {}
+        self._chain_configs: dict[int, ChainConfig] = {}
         self._sessions: list[aiohttp.ClientSession] = []
         self._resolver: aiohttp.abc.AbstractResolver | None = None
         self._health_checker: HealthChecker | None = None
@@ -100,6 +106,10 @@ class RPCRouter:
         self._providers[chain_id].append(state)
         self._providers[chain_id].sort(key=lambda s: s.config.priority)
 
+    def configure_chain(self, chain_id: int, config: ChainConfig) -> None:
+        """Override the router-wide health settings for one chain. Call before start()."""
+        self._chain_configs[chain_id] = config
+
     async def start(self) -> None:
         """Run initial health check and start background checker."""
         if self._started:
@@ -111,6 +121,8 @@ class RPCRouter:
             max_block_lag=self._max_block_lag,
             timeout=self._health_check_timeout,
             retry_interval=self._retry_interval,
+            max_lag_seconds=self._max_lag_seconds,
+            chain_configs=self._chain_configs,
         )
         await self._health_checker.check_all()
         self._health_checker.start()
@@ -337,6 +349,8 @@ class RPCRouter:
                     # "the health checker has stopped running".
                     "consecutive_failures": p.consecutive_failures,
                     "backoff_remaining": max(0.0, p.next_check - now),
+                    # 0 until two health-check answers have been seen.
+                    "seconds_per_block": p.seconds_per_block,
                 }
                 for p in providers
             ]

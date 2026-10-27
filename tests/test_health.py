@@ -5,7 +5,7 @@ import time
 import pytest
 
 from web3_rpc_router.health import HealthChecker
-from web3_rpc_router.provider import ProviderConfig, ProviderState
+from web3_rpc_router.provider import ChainConfig, ProviderConfig, ProviderState
 
 
 class _FakeResponse:
@@ -862,3 +862,338 @@ class TestProbeResponseParsing:
         assert broken.healthy is False
         assert broken.consecutive_failures == 1
         assert broken.last_block == 0
+
+
+class _Clock:
+    """Stands in for the ``time`` module in ``web3_rpc_router.health``: wall and monotonic time
+    are both set by the test, so a probe never looks stalled."""
+
+    def __init__(self, now: float):
+        self.now = now
+
+    def time(self) -> float:
+        return self.now
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class TestLagInSeconds:
+    """A provider is in sync within max_block_lag blocks or max_lag_seconds of the best block,
+    whichever allows more, once the chain's block time has been measured between two cycles."""
+
+    async def _two_cycles(self, monkeypatch, *, blocks_per_minute, behind, max_lag_seconds):
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        head = _make_provider("head", block_number=10_000)
+        other = _make_provider("other", priority=2, block_number=10_000)
+        checker = HealthChecker(
+            {1: [head, other]},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            max_lag_seconds=max_lag_seconds,
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(head, 10_000 + blocks_per_minute)
+        _set_block(other, 10_000 + blocks_per_minute - behind)
+        await checker.check_all()
+        return head, other
+
+    @pytest.mark.asyncio
+    async def test_fast_chain_trails_by_seconds_not_blocks(self, monkeypatch):
+        """0.1s blocks: 50 blocks behind is 5s, inside a 10s allowance."""
+        head, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=50, max_lag_seconds=10
+        )
+        assert head.healthy is True
+        assert other.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_fast_chain_past_the_allowance_is_unhealthy(self, monkeypatch):
+        """0.1s blocks: 150 blocks behind is 15s, past a 10s allowance."""
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=150, max_lag_seconds=10
+        )
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_without_a_seconds_allowance_lag_is_in_blocks(self, monkeypatch):
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=50, max_lag_seconds=0
+        )
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_slow_chain_keeps_the_block_allowance(self, monkeypatch):
+        """12s blocks: 4 blocks behind is 48s, past 10s, but within max_block_lag."""
+        _, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=5, behind=4, max_lag_seconds=10
+        )
+        assert other.healthy is True
+
+    @pytest.mark.asyncio
+    async def test_first_cycle_judges_in_blocks(self, monkeypatch):
+        """No block time is known before the head has advanced once."""
+        from web3_rpc_router import health
+
+        monkeypatch.setattr(health, "time", _Clock(1_000.0))
+        head = _make_provider("head", block_number=10_050)
+        other = _make_provider("other", priority=2, block_number=10_000)
+        checker = HealthChecker(
+            {1: [head, other]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        assert other.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_block_time_is_kept_per_chain(self, monkeypatch):
+        """A fast chain's block time does not loosen a slow chain's allowance."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        fast = [_make_provider("f1", block_number=10_000), _make_provider("f2", 2, 10_000)]
+        slow = [_make_provider("s1", block_number=500), _make_provider("s2", 2, 500)]
+        checker = HealthChecker(
+            {1: fast, 2: slow}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(fast[0], 10_600)
+        _set_block(fast[1], 10_550)  # 5s behind on a 0.1s chain
+        _set_block(slow[0], 505)
+        _set_block(slow[1], 499)  # 6 blocks behind on a 12s chain
+        await checker.check_all()
+
+        assert fast[1].healthy is True
+        assert slow[1].healthy is False
+
+    @pytest.mark.asyncio
+    async def test_one_wrong_block_number_does_not_lift_the_lag_check(self, monkeypatch):
+        """One provider answers a far-future block once. Its rate is near zero, but the median
+        of the four providers keeps the 2s block time, so a provider stuck 30 blocks (60s)
+        behind is still caught once the spike is gone."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        good, other, stuck, wild = (
+            _make_provider("good", 1, 10_000),
+            _make_provider("other", 2, 10_000),
+            _make_provider("stuck", 3, 10_000),
+            _make_provider("wild", 4, 10_000),
+        )
+        checker = HealthChecker(
+            {1: [good, other, stuck, wild]},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            max_lag_seconds=10,
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        for p in (good, other, stuck):
+            _set_block(p, 10_030)
+        _set_block(wild, 10_000_000)
+        await checker.check_all()
+
+        clock.now += 60
+        for p in (good, other, wild):
+            _set_block(p, 10_060)
+        _set_block(stuck, 10_030)
+        await checker.check_all()
+
+        assert good.healthy is True
+        assert other.healthy is True
+        assert stuck.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_two_providers_one_wrong_block_number(self, monkeypatch):
+        """With two providers the higher middle rate is taken, so the near-zero rate of a
+        far-future answer cannot double the allowance: a provider 8 blocks (16s) behind on a
+        2s chain is caught, where a plain mean of the two rates would allow 10 blocks."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        good = _make_provider("good", 1, 10_000)
+        wild = _make_provider("wild", 2, 10_000)
+        checker = HealthChecker(
+            {1: [good, wild]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(good, 10_030)
+        _set_block(wild, 10_000_000)
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(good, 10_060)
+        _set_block(wild, 10_052)
+        await checker.check_all()
+
+        assert good.healthy is True
+        assert wild.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_status_reports_the_measured_rate(self, monkeypatch):
+        from web3_rpc_router import RPCRouter, health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        head, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=0, max_lag_seconds=10
+        )
+        router = RPCRouter()
+        router._providers[1] = [head, other]
+        assert router.status()[1][0]["seconds_per_block"] == pytest.approx(0.1)
+
+
+class TestFirstMeasurement:
+    @pytest.mark.asyncio
+    async def test_the_cycle_after_start_comes_early_with_a_seconds_allowance(self, monkeypatch):
+        """A cold start judges in blocks until a block time is measured, so the second cycle
+        runs within seconds rather than a full interval."""
+        from web3_rpc_router import health
+
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health.asyncio, "sleep", sleep)
+        checker = HealthChecker(
+            {1: [_make_provider("a")]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await checker._loop()
+        assert sleeps == [health._FIRST_MEASUREMENT_DELAY]
+
+    @pytest.mark.asyncio
+    async def test_without_a_seconds_allowance_the_cadence_is_unchanged(self, monkeypatch):
+        from web3_rpc_router import health
+
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health.asyncio, "sleep", sleep)
+        checker = HealthChecker({1: [_make_provider("a")]}, interval=60, max_block_lag=5, timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await checker._loop()
+        assert sleeps == [60]
+
+
+class TestChainConfig:
+    """A chain's ChainConfig overrides the router-wide health settings for that chain only."""
+
+    @pytest.mark.asyncio
+    async def test_a_chain_can_turn_the_seconds_rule_off(self, monkeypatch):
+        """Same 0.1s block time on both chains; only chain 2 opts out of the seconds rule."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        one = [_make_provider("a1", 1, 10_000), _make_provider("b1", 2, 10_000)]
+        two = [_make_provider("a2", 1, 10_000), _make_provider("b2", 2, 10_000)]
+        checker = HealthChecker(
+            {1: one, 2: two},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            max_lag_seconds=10,
+            chain_configs={2: ChainConfig(max_lag_seconds=0)},
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        for head, behind in (one, two):
+            _set_block(head, 10_600)
+            _set_block(behind, 10_550)
+        await checker.check_all()
+
+        assert one[1].healthy is True
+        assert two[1].healthy is False
+
+    @pytest.mark.asyncio
+    async def test_a_chain_can_set_its_own_block_lag(self):
+        p1 = [_make_provider("a1", 1, 100), _make_provider("b1", 2, 85)]
+        p2 = [_make_provider("a2", 1, 100), _make_provider("b2", 2, 85)]
+        checker = HealthChecker(
+            {1: p1, 2: p2},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            chain_configs={2: ChainConfig(max_block_lag=20)},
+        )
+        await checker.check_all()
+
+        assert p1[1].healthy is False
+        assert p2[1].healthy is True
+
+    @pytest.mark.asyncio
+    async def test_a_chain_override_alone_brings_the_early_cycle(self, monkeypatch):
+        from web3_rpc_router import health
+
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health.asyncio, "sleep", sleep)
+        checker = HealthChecker(
+            {1: [_make_provider("a")], 2: [_make_provider("b")]},
+            interval=60,
+            max_block_lag=5,
+            timeout=5,
+            chain_configs={2: ChainConfig(max_lag_seconds=10)},
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await checker._loop()
+        assert sleeps == [health._FIRST_MEASUREMENT_DELAY]
+
+    @pytest.mark.asyncio
+    async def test_configure_chain_reaches_the_health_checker(self, monkeypatch):
+        from web3_rpc_router import ChainConfig as ExportedChainConfig
+        from web3_rpc_router import RPCRouter
+        from web3_rpc_router import router as router_module
+
+        captured = {}
+
+        class _Checker:
+            def __init__(self, **kwargs):
+                captured.update(kwargs)
+
+            async def check_all(self):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                return None
+
+        monkeypatch.setattr(router_module, "HealthChecker", _Checker)
+        router = RPCRouter(max_lag_seconds=10)
+        router.add_provider(4663, ProviderConfig(name="a", url="http://a", priority=1))
+        config = ExportedChainConfig(max_lag_seconds=0)
+        router.configure_chain(4663, config)
+        await router.start()
+        try:
+            assert captured["chain_configs"] == {4663: config}
+            assert captured["max_lag_seconds"] == 10
+        finally:
+            await router.stop()
