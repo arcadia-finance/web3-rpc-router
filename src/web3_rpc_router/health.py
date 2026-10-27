@@ -20,6 +20,10 @@ _BACKOFF_MAX_DOUBLINGS = 16
 # A probe that timed out only after this multiple of its timeout had passed was not
 # timed out by its provider: the event loop could not run the timer on time.
 _STALL_FACTOR = 2.0
+# With ``max_lag_seconds`` set, the cycle after start() runs this soon instead of a full
+# interval, so a fast chain's block time is measured within seconds of a cold start rather
+# than judged by the block count until the next regular cycle.
+_FIRST_MEASUREMENT_DELAY = 5.0
 
 
 class _LoopStalled(Exception):
@@ -45,10 +49,6 @@ class HealthChecker:
         self._max_lag_seconds = max_lag_seconds
         self._timeout = timeout
         self._task: asyncio.Task | None = None
-        # Per provider (by id): its last answered block and when, and the seconds per block
-        # measured between two of its answers. See ``_allowed_lag``.
-        self._last_answer: dict[int, tuple[int, float]] = {}
-        self._seconds_per_block: dict[int, float] = {}
 
     def start(self) -> None:
         """Start the background health check loop."""
@@ -94,8 +94,12 @@ class HealthChecker:
         return any(not p.healthy for _, p in self._due_providers(time.time()))
 
     async def _loop(self) -> None:
+        first = True
         while True:
             sleep = self._retry_interval if self._has_unhealthy() else self._interval
+            if first and self._max_lag_seconds:
+                sleep = min(sleep, _FIRST_MEASUREMENT_DELAY)
+            first = False
             await asyncio.sleep(sleep)
             try:
                 await self.check_all()
@@ -168,6 +172,9 @@ class HealthChecker:
             chain_results.setdefault(chain_id, []).append((p, result))
 
         now = time.time()
+        # Rates are durations, so they use the monotonic clock. Every answer of the cycle is
+        # timed at its end, after gather returned; see ``_measure_block_time``.
+        answered_at = time.monotonic()
 
         # Process results per chain
         for chain_id, provider_results in chain_results.items():
@@ -198,7 +205,7 @@ class HealthChecker:
                             p.consecutive_failures,
                         )
                 else:
-                    self._measure_block_time(p, result, now)
+                    self._measure_block_time(p, result, answered_at)
                     p.last_block = result
                     p.consecutive_failures = 0
                     p.next_check = 0.0
@@ -249,16 +256,20 @@ class HealthChecker:
                         p.last_block,
                     )
 
-    def _measure_block_time(self, p: ProviderState, block: int, now: float) -> None:
-        """Record ``p``'s answer and, if it advanced since its last one, the seconds per block.
+    @staticmethod
+    def _measure_block_time(p: ProviderState, block: int, answered_at: float) -> None:
+        """Measure ``p``'s seconds per block from its previous answer to this one.
 
-        The last answer is always overwritten, so a wrong block number is forgotten at the
+        Called before ``p.last_block`` takes ``block``. Answers are timed at the end of their
+        cycle rather than individually: a probe running to its timeout shifts every rate of
+        that cycle by at most the timeout over the interval (5s over 60s, about 8%). The
+        previous answer is always replaced, so a wrong block number is forgotten at the
         provider's next answer; a stalled or regressed provider keeps its previous rate.
         """
-        previous = self._last_answer.get(id(p))
-        self._last_answer[id(p)] = (block, now)
-        if previous is not None and block > previous[0] and now > previous[1]:
-            self._seconds_per_block[id(p)] = (now - previous[1]) / (block - previous[0])
+        advanced = p.last_answer_at and block > p.last_block and answered_at > p.last_answer_at
+        if advanced:
+            p.seconds_per_block = (answered_at - p.last_answer_at) / (block - p.last_block)
+        p.last_answer_at = answered_at
 
     def _allowed_lag(self, chain_id: int) -> int:
         """Blocks a provider may trail this cycle's best block by and still count as in sync.
@@ -271,17 +282,18 @@ class HealthChecker:
 
         The chain's block time is the median of its providers' own rates, each measured between
         two of that provider's answers. One provider's wrong block number, or a catch-up jump
-        after a stall, skews only its own rate, which the median outvotes. Until a rate has been
-        measured, and when ``max_lag_seconds`` is 0, only the block count applies.
+        after a stall, skews only its own rate, which the median outvotes. With an even count
+        the higher middle rate is taken (the slower block time, so the smaller allowance): on a
+        two-provider chain a near-zero rate from one wrong answer then cannot widen it. Until a
+        rate has been measured, and when ``max_lag_seconds`` is 0, only the block count applies.
         """
         rates = [
-            self._seconds_per_block[id(p)]
-            for p in self._providers.get(chain_id, [])
-            if id(p) in self._seconds_per_block
+            p.seconds_per_block for p in self._providers.get(chain_id, []) if p.seconds_per_block
         ]
         if not self._max_lag_seconds or not rates:
             return self._max_block_lag
-        return max(self._max_block_lag, int(self._max_lag_seconds / statistics.median(rates)))
+        block_time = statistics.median_high(rates)
+        return max(self._max_block_lag, int(self._max_lag_seconds / block_time))
 
     def _backoff_delay(self, failures: int) -> float:
         """Seconds to skip a provider that has failed ``failures`` checks in a row.

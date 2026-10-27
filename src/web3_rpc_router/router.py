@@ -342,6 +342,8 @@ class RPCRouter:
                     # "the health checker has stopped running".
                     "consecutive_failures": p.consecutive_failures,
                     "backoff_remaining": max(0.0, p.next_check - now),
+                    # 0 until two health-check answers have been seen.
+                    "seconds_per_block": p.seconds_per_block,
                 }
                 for p in providers
             ]

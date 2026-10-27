@@ -865,8 +865,8 @@ class TestProbeResponseParsing:
 
 
 class _Clock:
-    """Stands in for the ``time`` module in ``web3_rpc_router.health``: wall time is set by the
-    test, monotonic time stays real so probe stall detection is unaffected."""
+    """Stands in for the ``time`` module in ``web3_rpc_router.health``: wall and monotonic time
+    are both set by the test, so a probe never looks stalled."""
 
     def __init__(self, now: float):
         self.now = now
@@ -874,9 +874,8 @@ class _Clock:
     def time(self) -> float:
         return self.now
 
-    @staticmethod
-    def monotonic() -> float:
-        return time.monotonic()
+    def monotonic(self) -> float:
+        return self.now
 
 
 class TestLagInSeconds:
@@ -1015,3 +1014,83 @@ class TestLagInSeconds:
         assert good.healthy is True
         assert other.healthy is True
         assert stuck.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_two_providers_one_wrong_block_number(self, monkeypatch):
+        """With two providers the higher middle rate is taken, so the near-zero rate of a
+        far-future answer cannot double the allowance: a provider 8 blocks (16s) behind on a
+        2s chain is caught, where a plain mean of the two rates would allow 10 blocks."""
+        from web3_rpc_router import health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        good = _make_provider("good", 1, 10_000)
+        wild = _make_provider("wild", 2, 10_000)
+        checker = HealthChecker(
+            {1: [good, wild]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(good, 10_030)
+        _set_block(wild, 10_000_000)
+        await checker.check_all()
+
+        clock.now += 60
+        _set_block(good, 10_060)
+        _set_block(wild, 10_052)
+        await checker.check_all()
+
+        assert good.healthy is True
+        assert wild.healthy is False
+
+    @pytest.mark.asyncio
+    async def test_status_reports_the_measured_rate(self, monkeypatch):
+        from web3_rpc_router import RPCRouter, health
+
+        clock = _Clock(1_000.0)
+        monkeypatch.setattr(health, "time", clock)
+        head, other = await self._two_cycles(
+            monkeypatch, blocks_per_minute=600, behind=0, max_lag_seconds=10
+        )
+        router = RPCRouter()
+        router._providers[1] = [head, other]
+        assert router.status()[1][0]["seconds_per_block"] == pytest.approx(0.1)
+
+
+class TestFirstMeasurement:
+    @pytest.mark.asyncio
+    async def test_the_cycle_after_start_comes_early_with_a_seconds_allowance(self, monkeypatch):
+        """A cold start judges in blocks until a block time is measured, so the second cycle
+        runs within seconds rather than a full interval."""
+        from web3_rpc_router import health
+
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health.asyncio, "sleep", sleep)
+        checker = HealthChecker(
+            {1: [_make_provider("a")]}, interval=60, max_block_lag=5, timeout=5, max_lag_seconds=10
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await checker._loop()
+        assert sleeps == [health._FIRST_MEASUREMENT_DELAY]
+
+    @pytest.mark.asyncio
+    async def test_without_a_seconds_allowance_the_cadence_is_unchanged(self, monkeypatch):
+        from web3_rpc_router import health
+
+        sleeps = []
+
+        async def sleep(seconds):
+            sleeps.append(seconds)
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(health.asyncio, "sleep", sleep)
+        checker = HealthChecker({1: [_make_provider("a")]}, interval=60, max_block_lag=5, timeout=5)
+        with pytest.raises(asyncio.CancelledError):
+            await checker._loop()
+        assert sleeps == [60]

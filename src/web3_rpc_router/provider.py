@@ -89,6 +89,11 @@ class ProviderState:
     # Epoch seconds before which the background checker skips probing this provider,
     # so a provider that stays down is polled progressively less often.
     next_check: float = 0.0
+    # Monotonic time of the last health-check answer (0 before the first), and the seconds
+    # per block measured between two answers (0 until measured). The chain's block time is
+    # the median of its providers' rates; see HealthChecker._allowed_lag.
+    last_answer_at: float = 0.0
+    seconds_per_block: float = 0.0
 
     def __post_init__(self) -> None:
         timeout = self.config.request_timeout
