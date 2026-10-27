@@ -39,9 +39,9 @@ class ProviderConfig:
 
 # Both providers are built with ``exception_retry_configuration=None``: one call is one HTTP
 # request. web3's default resends a failed read to the same provider up to five times, with about
-# 1.9s of backoff, on any HTTP or connection error, so a rate limit, a rejected key or a server
-# error reached RoutingProvider or a consumer's report_failure only after that delay, and a
-# provider failing slowly enough overran the consumer's own timeout and was never reported.
+# 1.9s of backoff, on any HTTP or connection error. A rate limit, a rejected key or a server error
+# would then reach RoutingProvider or a consumer's report_failure only after that delay, and a
+# provider failing slowly enough would overrun the consumer's own timeout and never be reported.
 # Where a failed request goes next is the router's decision: RoutingProvider sends it to the next
 # provider, and get_web3 / get_async_web3 consumers retry after report_failure.
 
