@@ -40,6 +40,18 @@ _CHAIN_ID_CACHE: dict[str, Any] = {
 
 
 @dataclass
+class ChainConfig:
+    """Health settings for one chain, overriding the router-wide values.
+
+    A field left None takes the value given to ``RPCRouter``. Register with
+    ``RPCRouter.configure_chain``; a chain without one uses the router-wide values throughout.
+    """
+
+    max_block_lag: int | None = None
+    max_lag_seconds: float | None = None
+
+
+@dataclass
 class ProviderConfig:
     """Configuration for a single RPC provider."""
 

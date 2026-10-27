@@ -5,8 +5,9 @@ import json
 import logging
 import statistics
 import time
+from typing import Any
 
-from web3_rpc_router.provider import ProviderState
+from web3_rpc_router.provider import ChainConfig, ProviderState
 
 logger = logging.getLogger("web3_rpc_router")
 
@@ -41,8 +42,10 @@ class HealthChecker:
         timeout: float,
         retry_interval: float = 30.0,
         max_lag_seconds: float = 0.0,
+        chain_configs: dict[int, ChainConfig] | None = None,
     ) -> None:
         self._providers = providers
+        self._chain_configs = chain_configs if chain_configs is not None else {}
         self._interval = interval
         self._retry_interval = retry_interval
         self._max_block_lag = max_block_lag
@@ -97,7 +100,7 @@ class HealthChecker:
         first = True
         while True:
             sleep = self._retry_interval if self._has_unhealthy() else self._interval
-            if first and self._max_lag_seconds:
+            if first and any(self._setting(c, "max_lag_seconds") for c in self._providers):
                 sleep = min(sleep, _FIRST_MEASUREMENT_DELAY)
             first = False
             await asyncio.sleep(sleep)
@@ -287,13 +290,21 @@ class HealthChecker:
         two-provider chain a near-zero rate from one wrong answer then cannot widen it. Until a
         rate has been measured, and when ``max_lag_seconds`` is 0, only the block count applies.
         """
+        max_block_lag = self._setting(chain_id, "max_block_lag")
+        max_lag_seconds = self._setting(chain_id, "max_lag_seconds")
         rates = [
             p.seconds_per_block for p in self._providers.get(chain_id, []) if p.seconds_per_block
         ]
-        if not self._max_lag_seconds or not rates:
-            return self._max_block_lag
+        if not max_lag_seconds or not rates:
+            return max_block_lag
         block_time = statistics.median_high(rates)
-        return max(self._max_block_lag, int(self._max_lag_seconds / block_time))
+        return max(max_block_lag, int(max_lag_seconds / block_time))
+
+    def _setting(self, chain_id: int, name: str) -> Any:
+        """Health setting ``name`` for ``chain_id``: the chain's ``ChainConfig`` value when it
+        sets one, else the router-wide value."""
+        value = getattr(self._chain_configs.get(chain_id), name, None)
+        return getattr(self, f"_{name}") if value is None else value
 
     def _backoff_delay(self, failures: int) -> float:
         """Seconds to skip a provider that has failed ``failures`` checks in a row.
